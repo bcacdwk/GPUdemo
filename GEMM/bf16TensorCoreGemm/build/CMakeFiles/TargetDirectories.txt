@@ -1,0 +1,3 @@
+/home/yanxia/hanyong/CUDAsampleSHY/Samples/3_CUDA_Features/bf16TensorCoreGemm/build/CMakeFiles/bf16TensorCoreGemm.dir
+/home/yanxia/hanyong/CUDAsampleSHY/Samples/3_CUDA_Features/bf16TensorCoreGemm/build/CMakeFiles/edit_cache.dir
+/home/yanxia/hanyong/CUDAsampleSHY/Samples/3_CUDA_Features/bf16TensorCoreGemm/build/CMakeFiles/rebuild_cache.dir

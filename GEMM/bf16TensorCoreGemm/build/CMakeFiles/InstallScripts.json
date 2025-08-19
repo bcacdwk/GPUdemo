@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/yanxia/hanyong/CUDAsampleSHY/Samples/3_CUDA_Features/bf16TensorCoreGemm/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

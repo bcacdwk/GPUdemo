@@ -1,0 +1,1 @@
+/usr/bin/g++ @CMakeFiles/bf16TensorCoreGemm.dir/objects1.rsp CMakeFiles/bf16TensorCoreGemm.dir/cmake_device_link.o -o bf16TensorCoreGemm @CMakeFiles/bf16TensorCoreGemm.dir/linkLibs.rsp -L"/usr/local/cuda-12.2/targets/x86_64-linux/lib/stubs" -L"/usr/local/cuda-12.2/targets/x86_64-linux/lib"
