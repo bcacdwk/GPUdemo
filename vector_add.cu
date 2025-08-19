@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h> // For malloc/free
+#include <math.h>   // For fabs
 #include <cuda_runtime.h>
 
 // CUDA 错误检查宏
@@ -23,9 +24,16 @@ int main() {
     // 定义向量长度
     int n = 1024;
     size_t size = n * sizeof(float);
+    int i; // 声明循环变量
+    
+    // 声明所有变量
+    float *h_a, *h_b, *h_c;
+    float *d_a, *d_b, *d_c;
+    int threadsPerBlock = 256;
+    int blocksPerGrid;
+    int success = 1;
 
     // 1. 分配主机内存
-    float *h_a, *h_b, *h_c;
     h_a = (float*)malloc(size);
     h_b = (float*)malloc(size);
     h_c = (float*)malloc(size);
@@ -35,13 +43,12 @@ int main() {
     }
 
     // 2. 初始化主机数据
-    for (int i = 0; i < n; ++i) {
+    for (i = 0; i < n; ++i) {
         h_a[i] = i * 1.0f;
         h_b[i] = i * 2.0f;
     }
 
     // 3. 分配设备内存
-    float *d_a, *d_b, *d_c;
     CUDA_CHECK(cudaMalloc((void**)&d_a, size));
     CUDA_CHECK(cudaMalloc((void**)&d_b, size));
     CUDA_CHECK(cudaMalloc((void**)&d_c, size));
@@ -51,8 +58,7 @@ int main() {
     CUDA_CHECK(cudaMemcpy(d_b, h_b, size, cudaMemcpyHostToDevice));
 
     // 5. 设置线程块和网格维度
-    int threadsPerBlock = 256;
-    int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
+    blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
 
     // 6. 执行核函数
     vectorAdd<<<blocksPerGrid, threadsPerBlock>>>(d_a, d_b, d_c, n);
@@ -63,12 +69,11 @@ int main() {
     CUDA_CHECK(cudaMemcpy(h_c, d_c, size, cudaMemcpyDeviceToHost));
 
     // 8. 验证结果
-    bool success = true;
-    for (int i = 0; i < 10; ++i) { // 只检查前10个结果作为示例
+    for (i = 0; i < 10; ++i) { // 只检查前10个结果作为示例
         printf("h_a[%d]=%.1f, h_b[%d]=%.1f, h_c[%d]=%.1f\n", i, h_a[i], i, h_b[i], i, h_c[i]);
-        if (abs(h_c[i] - (h_a[i] + h_b[i])) > 1e-5) {
+        if (fabs(h_c[i] - (h_a[i] + h_b[i])) > 1e-5) {
             printf("Verification FAILED at index %d!\n", i);
-            success = false;
+            success = 0;
         }
     }
     if(success) {
