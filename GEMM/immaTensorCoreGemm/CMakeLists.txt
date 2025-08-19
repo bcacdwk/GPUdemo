@@ -18,7 +18,7 @@ else()
 endif()
 
 # Include directories and libraries
-include_directories(../../../Common)
+include_directories(../../../CUDAsampleSHY/Common)
 
 # Source file
 # Add target for immaTensorCoreGemm

@@ -1,0 +1,3 @@
+D:/OneDrive/Files/Python/MSRA/GPUdemo/GEMM/immaTensorCoreGemm/build/CMakeFiles/immaTensorCoreGemm.dir
+D:/OneDrive/Files/Python/MSRA/GPUdemo/GEMM/immaTensorCoreGemm/build/CMakeFiles/ALL_BUILD.dir
+D:/OneDrive/Files/Python/MSRA/GPUdemo/GEMM/immaTensorCoreGemm/build/CMakeFiles/ZERO_CHECK.dir
