@@ -1,0 +1,1213 @@
+/*
+ * =============================================================================
+ * IMMA Tensor Core GEMM 性能基准测试程序
+ * =============================================================================
+ * 功能说明：
+ * 本程序用于对比两种不同的CUDA WMMA (Warp Matrix Multiply Accumulate) GEMM实现：
+ * 1. simple_wmma_gemm_imma - 简单的WMMA实现（无共享内存优化）
+ * 2. compute_gemm_imma - 高性能WMMA实现（带共享内存优化）
+ * 
+ * 测试目标：
+ * - 在不同矩阵维度下测试两种实现的性能
+ * - 测量GPU延迟、吞吐量(TOPS)和内存带宽
+ * - 通过CPU参考实现验证计算正确性
+ * - 将结果输出到CSV文件供进一步分析
+ * 
+ * 重要说明：
+ * 所有kernel函数均完全复制自NVIDIA官方CUDA样例代码，未做任何修改，
+ * 确保性能基准测试的准确性和可重复性。
+ * =============================================================================
+ */
+
+#include <assert.h>
+#include <cuda.h>
+#include <mma.h>
+#include <stdio.h>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <cstdlib>
+#include <cstring>
+#include <chrono>
+
+// CUDA辅助函数库
+#include <helper_cuda.h>
+#include <helper_functions.h>
+
+using namespace std;
+using namespace nvcuda;
+
+// =============================================================================
+// 错误检查宏定义
+// =============================================================================
+
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA错误 %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
+
+#define checkKernelErrors(expr) \
+    do { \
+        expr; \
+        cudaError_t __err = cudaGetLastError(); \
+        if (__err != cudaSuccess) { \
+            printf("内核执行错误 %d行: '%s' 失败: %s\n", __LINE__, #expr, cudaGetErrorString(__err)); \
+            abort(); \
+        } \
+    } while (0)
+
+#ifndef MAX
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#endif
+
+// =============================================================================
+// WMMA和GEMM配置常量（来自NVIDIA官方CUDA样例代码，保持完全一致）
+// =============================================================================
+
+// ========== GPU基础配置 ==========
+#define WARP_SIZE 32                    // GPU warp大小，NVIDIA GPU固定为32个线程
+
+// ========== WMMA矩阵块的基础维度 ==========
+// Tensor Core WMMA操作的基本矩阵块大小，对于INT8 IMMA固定为16x16x16
+#define M 16                            // WMMA矩阵块的M维度（输出矩阵的行数）
+#define N 16                            // WMMA矩阵块的N维度（输出矩阵的列数）  
+#define K 16                            // WMMA矩阵块的K维度（内积维度）
+
+// WMMA API使用的矩阵维度定义（与上面保持一致）
+#define WMMA_M 16                       // WMMA API的M维度
+#define WMMA_N 16                       // WMMA API的N维度
+#define WMMA_K 16                       // WMMA API的K维度
+
+// ========== GEMM全局矩阵配置 ==========
+// 定义全局矩阵由多少个16x16的WMMA块组成（官方默认配置）
+#define M_TILES 256                     // M维度的块数量（256个16x16块）
+#define N_TILES 256                     // N维度的块数量（256个16x16块）
+#define K_TILES 256                     // K维度的块数量（256个16x16块）
+
+// 计算全局矩阵的实际维度
+#define M_GLOBAL (M * M_TILES)          // 全局矩阵A和C的行数 = 16 * 256 = 4096
+#define N_GLOBAL (N * N_TILES)          // 全局矩阵B和C的列数 = 16 * 256 = 4096
+#define K_GLOBAL (K * K_TILES)          // 全局矩阵A和B的内积维度 = 16 * 256 = 4096
+
+// ========== 矩阵存储布局配置 ==========
+#define C_LAYOUT wmma::mem_row_major    // C和D矩阵使用行主序存储布局
+
+// ========== 高性能kernel的CTA配置 ==========
+#define WARPS_PER_BLOCK   8             // 每个CTA包含8个warp
+#define THREADS_PER_BLOCK (WARP_SIZE * WARPS_PER_BLOCK)  // 每个CTA的线程总数 = 32 * 8 = 256
+
+// ========== 共享内存使用策略配置 ==========
+#ifndef SHARED_MEMORY_LIMIT_64K
+#define SHARED_MEMORY_LIMIT_64K 1       // 默认限制共享内存使用量为64KB以兼容更多GPU
+#endif
+
+// 根据共享内存限制选择每次缓存的K维度大小
+#if SHARED_MEMORY_LIMIT_64K
+#define CHUNK_K 8                       // 64KB限制下：每次缓存8个K块（8*16=128）
+#else
+#define CHUNK_K 16                      // 无限制下：每次缓存16个K块（16*16=256）
+#endif
+
+// ========== 内存访问和数据复制配置 ==========
+// 计算向量化内存访问的相关参数
+#define CHUNK_LINE_BYTES          (CHUNK_K * K * sizeof(uint8_t))      // 每行数据字节数 = 8*16*1 = 128字节
+#define WARP_COPY_BYTES           (WARP_SIZE * sizeof(int4))            // 每个warp复制的字节数 = 32*16 = 512字节
+#define CHUNK_COPY_LINES_PER_WARP (WARP_COPY_BYTES / CHUNK_LINE_BYTES) // 每个warp复制的行数 = 512/128 = 4行
+#define CHUNK_COPY_LINE_LANES     (WARP_SIZE / CHUNK_COPY_LINES_PER_WARP) // 每行参与的lane数 = 32/4 = 8个lane
+
+// ========== CTA（Cooperative Thread Array）内的Warp组织结构 ==========
+// 定义CTA内warp的2D组织方式，用于分配计算任务
+#define BLOCK_ROW_WARPS 2               // CTA在行方向有2个warp组
+#define BLOCK_COL_WARPS 4               // CTA在列方向有4个warp组（总共2*4=8个warp）
+
+// 定义每个warp负责计算的矩阵块数量
+#define WARP_ROW_TILES 4                // 每个warp在行方向计算4个16x16块
+#define WARP_COL_TILES 2                // 每个warp在列方向计算2个16x16块（每个warp计算4*2=8个块）
+
+// 计算整个CTA负责的矩阵块范围
+#define BLOCK_ROW_TILES (WARP_ROW_TILES * BLOCK_ROW_WARPS)  // CTA在行方向的块数 = 4*2 = 8块（128行）
+#define BLOCK_COL_TILES (WARP_COL_TILES * BLOCK_COL_WARPS)  // CTA在列方向的块数 = 2*4 = 8块（128列）
+
+// ========== 内存访问步长配置 ==========
+// 定义各种内存访问的步长，用于计算内存地址偏移
+#define GLOBAL_MEM_STRIDE N_GLOBAL      // 全局内存按行访问的步长 = 4096（下一行的起始位置）
+#define SHMEM_STRIDE (N * BLOCK_ROW_TILES)  // 共享内存的步长 = 16*8 = 128（共享内存中下一行的位置）
+#define SHMEM_OFFSET (N * WARP_ROW_TILES)   // 每个warp在共享内存中的偏移 = 16*4 = 64
+
+// ========== 共享内存Bank冲突优化配置 ==========
+// 为避免共享内存bank冲突而添加的偏移量
+// 每行/列偏移32个uint8_t元素，确保256位对齐并将不同行/列映射到不同bank
+#define SKEW_UINT8 32                   // bank冲突避免偏移：32字节（256位对齐要求）
+
+// =============================================================================
+// KERNEL 1: 高性能WMMA GEMM实现（带共享内存优化）
+// =============================================================================
+/*
+ * 功能：执行高性能的整数GEMM运算 D = alpha * A * B + beta * C
+ * 
+ * 核心算法思想：
+ * 1. 分块计算：每个CTA负责计算128x128的输出块，避免全局同步
+ * 2. 共享内存缓存：将A和B矩阵的块缓存到共享内存，减少全局内存访问带宽需求
+ * 3. 流水线设计：重叠计算和内存传输，提高GPU利用率
+ * 4. Bank冲突优化：通过SKEW技术避免共享内存访问冲突
+ * 5. 向量化访问：使用int4进行128位对齐的内存传输
+ * 
+ * CTA组织结构：
+ * - 每个CTA包含8个warp（256个线程）
+ * - 每个warp计算8个16x16子块，排列为2x4的网格
+ * - 整个CTA计算128x128的输出块（8x8个16x16子块）
+ * 
+ * 内存层次结构：
+ * - 全局内存：存储完整的A、B、C、D矩阵
+ * - 共享内存：缓存当前CTA正在处理的A和B矩阵块
+ * - 寄存器：WMMA fragments存储16x16的矩阵片段
+ * 
+ * 关键优化技术：
+ * 1. 数据重用：A和B的每个块被多个warp重复使用
+ * 2. 内存合并：使用int4确保128位对齐访问
+ * 3. 计算隐藏延迟：在计算的同时进行下一批数据的加载
+ * 4. 避免分支发散：使用统一的控制流
+ * 
+ * 参数说明：
+ * A: 输入矩阵A (M_GLOBAL x K_GLOBAL, 行主序, uint8_t类型)
+ * B: 输入矩阵B (K_GLOBAL x N_GLOBAL, 列主序, uint8_t类型)  
+ * C: 输入矩阵C (M_GLOBAL x N_GLOBAL, 行主序, int类型)
+ * D: 输出矩阵D (M_GLOBAL x N_GLOBAL, 行主序, int类型)
+ * alpha, beta: 标量系数
+ * 
+ * 注意：此函数完全复制自NVIDIA官方CUDA样例，未做任何修改
+ */
+__global__ void compute_gemm_imma(const uint8_t *A, const uint8_t *B, const int *C, int *D, int alpha, int beta)
+{
+    // ========== 共享内存声明和布局设计 ==========
+    // 动态共享内存声明：二维数组，每行包含 CHUNK_K*K + SKEW_UINT8 个uint8_t元素
+    // 设计原理：
+    // 1. 第一维：不同的矩阵块或行
+    // 2. 第二维：CHUNK_K*K个数据元素 + SKEW_UINT8个填充元素（避免bank冲突）
+    // 3. SKEW技术：通过添加偏移量，确保不同行映射到不同的内存bank
+    extern __shared__ uint8_t shmem[][CHUNK_K * K + SKEW_UINT8];
+
+    // ========== 线程身份识别 ==========
+    // 获取当前线程的warp ID和lane ID，用于任务分配和内存访问
+    const unsigned int warpId = threadIdx.x / WARP_SIZE;  // 当前线程所属的warp编号(0-7)
+    const unsigned int laneId = threadIdx.x % WARP_SIZE;  // 当前线程在warp内的编号(0-31)
+
+    // ========== 共享内存布局规划 ==========
+    // 计算B矩阵在共享内存中的起始偏移位置
+    // 共享内存布局：[A矩阵块] [B矩阵块]
+    // A矩阵占用：BLOCK_COL_TILES * M 行
+    // B矩阵从：BLOCK_COL_TILES * M 行开始存储
+    const size_t shmem_idx_b_off = BLOCK_COL_TILES * M;
+
+    // ========== Warp级别的内存指针计算 ==========
+    // 计算当前warp负责的C和D矩阵块在共享内存中的访问指针
+    // 设计思想：每个warp负责计算特定的子块，需要独立的内存区域
+    // 计算公式解析：
+    // - (warpId / 2)：将8个warp分为4组，每组2个warp
+    // - SHMEM_STRIDE * K * 2：每组warp占用的共享内存行数
+    // - (warpId % 2) * SHMEM_OFFSET：同组内warp的列偏移
+    int *shmem_warp_tile_ptr = (int *)&shmem[0][0] + (warpId / 2) * SHMEM_STRIDE * K * 2 + (warpId % 2) * SHMEM_OFFSET;
+
+    // 计算当前warp用于流式传输C和D矩阵的共享内存指针
+    // 用于整块数据的快速传输，每个warp有独立的传输区域
+    int *shmem_warp_stream_ptr = (int *)&shmem[0][0] + warpId * SHMEM_STRIDE * K;
+
+    // ========== 数值精度优化技巧 ==========
+    // 预先调整beta系数，避免在最终计算时的重复除法运算
+    // 原理：最终结果 = alpha * (A*B) + beta * C
+    // 由于后续会统一乘以alpha，这里预先将beta除以alpha
+    // 最终变为：alpha * ((A*B) + (beta/alpha) * C)
+    // 注意：这可能导致精度损失，但零值需要特殊处理
+    beta /= alpha;
+
+    // ========== 主循环：CTA滑动窗口算法 ==========
+    // 算法核心思想：
+    // 1. 每个CTA按顺序处理不同的128x128输出块
+    // 2. 使用block_pos作为全局块索引，支持多个CTA并行工作
+    // 3. 当所有块处理完毕时，自然退出循环
+    // 
+    // 滑动策略：
+    // - 从左上角开始，按行优先顺序遍历所有128x128块
+    // - 每个CTA处理block_pos, block_pos+gridDim.x, block_pos+2*gridDim.x, ...的块
+    // - 这种设计确保负载均衡和内存访问的局部性
+    for (unsigned int block_pos = blockIdx.x;; block_pos += gridDim.x) {
+        
+        // ========== 块位置计算（关键算法！容易出错的地方） ==========
+        // 将一维的block_pos转换为二维的矩阵块坐标(block_tile_i, block_tile_j)
+        // 
+        // 计算原理：
+        // 1. 总的列块数：N_TILES / BLOCK_COL_TILES
+        // 2. 当前在第几个行块组：(block_pos * BLOCK_ROW_TILES) / N_TILES
+        // 3. 实际的行块索引：需要乘以BLOCK_COL_TILES来跳过中间的行
+        // 
+        // 注意：这个计算非常容易出错，必须理解矩阵分块的逻辑！
+        const unsigned int block_tile_i = ((block_pos * BLOCK_ROW_TILES) / N_TILES) * (BLOCK_COL_TILES);
+        const unsigned int block_tile_j = (block_pos * BLOCK_COL_TILES) % N_TILES;
+
+        // ========== 循环终止条件检查 ==========
+        // 当行索引超出矩阵范围时，所有工作完成，退出循环
+        // 这是整个kernel的自然终止点
+        if (block_tile_i >= M_TILES) {
+            break;
+        }
+
+        // ========== C矩阵数据加载：全局内存到共享内存的流式传输 ==========
+        // 计算当前warp需要从全局内存复制C矩阵数据的起始地址
+        // 地址计算公式：
+        // - (block_tile_i + warpId) * M：当前warp负责的行起始位置
+        // - GLOBAL_MEM_STRIDE：全局内存中行与行之间的步长
+        // - block_tile_j * N：列起始位置
+        const size_t gmem_idx = (block_tile_i + warpId) * M * GLOBAL_MEM_STRIDE + block_tile_j * N;
+        const int *src_gmem_warp_stream_ptr = &C[gmem_idx];
+
+        // ========== 向量化内存传输（关键性能优化） ==========
+        // 将多个C矩阵块流式传输到共享内存
+        // 优化技术：
+        // 1. 使用int4类型实现128位对齐的向量化加载
+        // 2. 每个lane一次传输16字节，大幅提高内存带宽利用率
+        // 3. #pragma unroll指示编译器展开循环，减少循环开销
+        #pragma unroll
+        for (int i = 0; i < K; i++) {
+            typedef int4 copy_t;  // 128位向量化类型，确保内存合并访问
+
+            // 执行向量化内存拷贝：全局内存 -> 共享内存
+            // 每个线程负责一个int4（16字节）的传输
+            *((copy_t *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId) =
+                *((copy_t *)(src_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) + laneId);
+        }
+
+        // ========== 同步点1：确保C矩阵数据传输完成 ==========
+        // 关键作用：确保所有warp完成C矩阵从全局内存到共享内存的传输
+        // 在进行下一步之前，必须保证所有数据都已经在共享内存中可用
+        __syncthreads();
+
+        // ========== WMMA累加器Fragment声明 ==========
+        // 声明累加器fragments，用于沿K_GLOBAL维度累积A和B矩阵fragment乘法的结果
+        // 数组维度说明：
+        // - 第一维(WARP_COL_TILES=2)：每个warp在列方向处理的子块数
+        // - 第二维(WARP_ROW_TILES=4)：每个warp在行方向处理的子块数
+        // - 总共2x4=8个16x16的累加器，对应每个warp的计算任务
+        wmma::fragment<wmma::accumulator, M, N, K, int> c[WARP_COL_TILES][WARP_ROW_TILES];
+
+        // ========== C矩阵Fragment加载：共享内存到寄存器 ==========
+        // 从共享内存将C矩阵块加载到WMMA fragments中
+        // 这是为后续的乘加运算准备初始值
+        #pragma unroll
+        for (int i = 0; i < WARP_COL_TILES; i++) {           // 遍历列方向的子块
+            #pragma unroll
+            for (int j = 0; j < WARP_ROW_TILES; j++) {       // 遍历行方向的子块
+                // 计算当前子块在共享内存中的起始地址
+                // 地址计算：
+                // - shmem_warp_tile_ptr：当前warp的基础指针
+                // - i * SHMEM_STRIDE * K：列方向偏移
+                // - j * N：行方向偏移
+                const int *tile_ptr = shmem_warp_tile_ptr + i * SHMEM_STRIDE * K + j * N;
+                
+                // 将16x16的C矩阵子块加载到fragment中
+                // 参数说明：
+                // - c[i][j]：目标fragment
+                // - tile_ptr：源数据指针
+                // - SHMEM_STRIDE：共享内存中的行步长
+                // - C_LAYOUT：内存布局（行主序）
+                wmma::load_matrix_sync(c[i][j], tile_ptr, SHMEM_STRIDE, C_LAYOUT);
+            }
+        }
+
+        // ========== 同步点2：确保C矩阵Fragment加载完成 ==========
+        __syncthreads();
+
+        // ========== Beta系数预处理：C矩阵缩放 ==========
+        // 对所有C矩阵fragments应用beta缩放
+        // 原理：由于之前已经将beta除以alpha，这里直接乘以调整后的beta
+        // 目的：为后续的乘加运算准备正确的C矩阵初始值
+        #pragma unroll
+        for (int i = 0; i < WARP_COL_TILES; i++) {
+            #pragma unroll
+            for (int j = 0; j < WARP_ROW_TILES; j++) {
+                #pragma unroll
+                // 对fragment中的每个元素进行缩放
+                // 注意：fragment的内部存储结构是抽象的，但元素级操作是安全的
+                for (int t = 0; t < c[i][j].num_elements; t++) {
+                    c[i][j].x[t] *= beta;
+                }
+            }
+        }
+
+        // ========== A和B矩阵数据复制策略分配 ==========
+        // 智能任务分工：根据warp ID决定复制哪个矩阵
+        // 分工原则：
+        // - Warp 0-3：负责复制A矩阵的不同部分
+        // - Warp 4-7：负责复制B矩阵的不同部分
+        // 
+        // 地址计算解析：
+        // 对于A矩阵（warpId < 4）：
+        // - block_tile_i * M * K_GLOBAL：当前块行的起始地址
+        // - M * K_GLOBAL * (warpId % 4) * 2：当前warp负责的具体区域
+        // 对于B矩阵（warpId >= 4）：
+        // - block_tile_j * N * K_GLOBAL：当前块列的起始地址
+        // - N * K_GLOBAL * (warpId % 4) * 2：当前warp负责的具体区域
+        const uint8_t *warp_ptr = (warpId < 4) ? (&A[block_tile_i * M * K_GLOBAL] + M * K_GLOBAL * (warpId % 4) * 2)
+                                               : (&B[block_tile_j * N * K_GLOBAL] + N * K_GLOBAL * (warpId % 4) * 2);
+
+        // ========== K维度分块处理主循环 ==========
+        // 沿全局K维度按CHUNK_K大小的固定步长遍历
+        // 分块原理：
+        // 1. 将大的K维度分解为CHUNK_K大小的小块
+        // 2. 每次迭代处理CHUNK_K个K维度，减少共享内存需求
+        // 3. 在每个K块内进行完整的矩阵乘加运算
+        #pragma unroll
+        for (int tile_k = 0; tile_k < K_TILES; tile_k += CHUNK_K) {
+            
+            // ========== 共享内存索引计算（复杂但关键的部分） ==========
+            // 将A和B矩阵的当前K切片复制到共享内存
+            // 
+            // 索引计算逻辑：
+            // - CTA的前半部分warp (0-3) 复制A矩阵
+            // - CTA的后半部分warp (4-7) 复制B矩阵
+            // 
+            // A矩阵的共享内存布局：
+            // - M * (warpId % (WARPS_PER_BLOCK / 2)) * 2：当前warp的起始行
+            // B矩阵的共享内存布局：
+            // - N * (warpId % (WARPS_PER_BLOCK / 2)) * 2 + shmem_idx_b_off：
+            //   当前warp的起始行 + B矩阵在共享内存中的偏移
+            size_t shmem_idx = warpId < (WARPS_PER_BLOCK / 2)
+                                 ? (M * (warpId % (WARPS_PER_BLOCK / 2)) * 2)
+                                 : (N * (warpId % (WARPS_PER_BLOCK / 2)) * 2 + shmem_idx_b_off);
+
+            // ========== 复杂的内存访问模式（容易出错的地方！） ==========
+            // 计算每个lane在全局内存中的访问指针
+            // 
+            // 地址计算分解：
+            // 1. warp_ptr + tile_k * K：K维度的基础偏移
+            // 2. (laneId / CHUNK_COPY_LINE_LANES) * K_GLOBAL：lane组内的行偏移
+            // 3. (laneId % CHUNK_COPY_LINE_LANES)：lane组内的列偏移
+            // 
+            // 设计原理：
+            // - 每个warp内的lane按组工作
+            // - 前半部分lane复制第一行/列，后半部分复制下一行/列
+            // - 确保内存访问的合并和效率
+            int4 *lane_ptr = (int4 *)(warp_ptr + tile_k * K + (laneId / CHUNK_COPY_LINE_LANES) * K_GLOBAL)
+                           + (laneId % CHUNK_COPY_LINE_LANES);
+
+            // 根据lane在warp中的位置调整共享内存索引
+            // 目的：将warp的后半部分lane偏移到共享内存的下一行/列
+            shmem_idx += laneId / CHUNK_COPY_LINE_LANES;
+
+            // ========== 高效的向量化内存复制 ==========
+            // 执行实际的数据复制：全局内存 -> 共享内存
+            #pragma unroll
+            for (int i = 0; i < ((WARP_SIZE / 2) / CHUNK_COPY_LINES_PER_WARP) * 2; i++) {
+                // 每个lane一次复制16字节（int4类型）
+                // 这确保了128位对齐的高效内存访问
+                *((int4 *)&shmem[shmem_idx][0] + (laneId % CHUNK_COPY_LINE_LANES)) = *lane_ptr;
+
+                // 推进全局内存指针和共享内存索引到下一个处理位置
+                // 全局内存：跳到下一组行
+                // 共享内存：跳到下一行
+                lane_ptr = (int4 *)((uint8_t *)lane_ptr + K_GLOBAL * CHUNK_COPY_LINES_PER_WARP);
+                shmem_idx += CHUNK_COPY_LINES_PER_WARP;
+            }
+
+            // ========== 同步点3：确保A和B矩阵数据复制完成 ==========
+            __syncthreads();
+
+            // ========== 核心计算循环：WMMA矩阵乘法 ==========
+            // 在每个warp中计算C矩阵块的网格
+            // 这是整个算法的核心计算部分，实现高效的Tensor Core运算
+            #pragma unroll
+            for (int k_step = 0; k_step < CHUNK_K; k_step++) {
+                
+                // ========== A和B矩阵Fragment声明 ==========
+                // 为当前K步骤声明临时的A和B矩阵fragments
+                // 这些fragments将从共享内存加载，然后参与WMMA运算
+                wmma::fragment<wmma::matrix_a, M, N, K, uint8_t, wmma::row_major> a[WARP_COL_TILES]; // A矩阵fragments（行主序）
+                wmma::fragment<wmma::matrix_b, M, N, K, uint8_t, wmma::col_major> b[WARP_ROW_TILES]; // B矩阵fragments（列主序）
+
+                // ========== A矩阵Fragment加载和MMA计算 ==========
+                #pragma unroll
+                for (int i = 0; i < WARP_COL_TILES; i++) {  // 遍历当前warp的列方向子块
+                    
+                    // ========== A矩阵共享内存地址计算 ==========
+                    // 计算A矩阵fragment在共享内存中的位置
+                    // 地址计算公式：
+                    // - (warpId / 2) * M * 2：warp组的基础行偏移
+                    // - (i * M)：当前子块的行偏移
+                    size_t shmem_idx_a = (warpId / 2) * M * 2 + (i * M);
+                    const uint8_t *tile_ptr = &shmem[shmem_idx_a][k_step * K];
+
+                    // 从共享内存加载A矩阵fragment
+                    // 关键参数：
+                    // - a[i]：目标fragment
+                    // - tile_ptr：共享内存中的源数据指针
+                    // - K * CHUNK_K + SKEW_UINT8：共享内存的行步长（包含SKEW偏移）
+                    wmma::load_matrix_sync(a[i], tile_ptr, K * CHUNK_K + SKEW_UINT8);
+
+                    // ========== B矩阵Fragment加载和矩阵乘累加 ==========
+                    #pragma unroll
+                    for (int j = 0; j < WARP_ROW_TILES; j++) {  // 遍历当前warp的行方向子块
+                        
+                        // ========== 性能优化：B矩阵Fragment重用 ==========
+                        // 只在i==0时加载B矩阵fragment，因为同一个B fragment
+                        // 会与多个A fragment进行运算，避免重复加载
+                        if (i == 0) {
+                            // ========== B矩阵共享内存地址计算 ==========
+                            // 计算B矩阵fragment在共享内存中的位置
+                            // 地址计算公式：
+                            // - shmem_idx_b_off：B矩阵在共享内存中的起始偏移
+                            // - (WARP_ROW_TILES * N) * (warpId % 2)：当前warp组内的偏移
+                            // - (j * N)：当前子块的列偏移
+                            size_t shmem_idx_b = shmem_idx_b_off + (WARP_ROW_TILES * N) * (warpId % 2) + (j * N);
+                            const uint8_t *tile_ptr = &shmem[shmem_idx_b][k_step * K];
+
+                            // 从共享内存加载B矩阵fragment
+                            wmma::load_matrix_sync(b[j], tile_ptr, K * CHUNK_K + SKEW_UINT8);
+                        }
+
+                        // ========== 核心计算：Tensor Core矩阵乘累加 ==========
+                        // 执行 c[i][j] = c[i][j] + a[i] * b[j]
+                        // 这是整个算法的核心运算，利用GPU的Tensor Core硬件加速
+                        // 
+                        // 运算说明：
+                        // - a[i]：16x16的A矩阵fragment（uint8类型）
+                        // - b[j]：16x16的B矩阵fragment（uint8类型）
+                        // - c[i][j]：16x16的累加器fragment（int类型）
+                        // - 硬件自动处理类型转换和累加
+                        wmma::mma_sync(c[i][j], a[i], b[j], c[i][j]);
+                    }
+                }
+            }
+
+            // ========== 同步点4：确保当前K块的所有计算完成 ==========
+            __syncthreads();
+        }
+
+        // ========== 最终结果处理：Fragment到共享内存 ==========
+        // 将计算完成的D矩阵fragments存储到共享内存
+        // 这是计算阶段的最后一步，为后续的全局内存写入做准备
+        #pragma unroll
+        for (int i = 0; i < WARP_COL_TILES; i++) {
+            #pragma unroll
+            for (int j = 0; j < WARP_ROW_TILES; j++) {
+                
+                // ========== Alpha系数应用（关键的数值处理） ==========
+                // 对所有fragment元素进行alpha缩放
+                // 原理回顾：
+                // 1. 之前C矩阵已经乘以了 beta/alpha
+                // 2. A*B的结果现在乘以alpha
+                // 3. 最终得到：alpha * (A*B) + alpha * (beta/alpha * C) = alpha * (A*B) + beta * C
+                // 
+                // 重要说明：
+                // warp中所有线程对所有fragment元素的统一点变换是良定义的
+                // 即使fragment的内部存储结构是抽象的，元素级的变换仍然是安全的
+                #pragma unroll
+                for (int t = 0; t < c[i][j].num_elements; t++)
+                    c[i][j].x[t] *= alpha;
+
+                // ========== 结果存储：寄存器到共享内存 ==========
+                // 计算当前fragment在共享内存中的存储位置
+                int *tile_ptr = shmem_warp_tile_ptr + i * SHMEM_STRIDE * K + j * N;
+                
+                // 将处理完的fragment存储到共享内存
+                // 参数说明：
+                // - tile_ptr：共享内存中的目标位置
+                // - c[i][j]：源fragment（已经过alpha缩放）
+                // - SHMEM_STRIDE：共享内存的行步长
+                // - C_LAYOUT：存储布局（行主序）
+                wmma::store_matrix_sync(tile_ptr, c[i][j], SHMEM_STRIDE, C_LAYOUT);
+            }
+        }
+
+        // ========== 同步点5：确保所有D块写入共享内存完成 ==========
+        __syncthreads();
+
+        // ========== 最终数据传输：共享内存到全局内存 ==========
+        // 现在共享内存包含了当前CTA计算的所有D矩阵块
+        // 需要将它们高效地传输回全局内存
+        
+        // 计算当前warp在全局内存中的目标写入地址
+        int *dst_gmem_warp_stream_ptr = &D[gmem_idx];
+
+        // ========== 高性能向量化写入 ==========
+        // 使用与读取相同的向量化策略进行写入
+        #pragma unroll
+        for (int i = 0; i < K; i++) {
+            // 执行128位对齐的向量化写入：共享内存 -> 全局内存
+            // 每个lane负责传输一个int4（16字节）
+            // 这确保了高效的内存带宽利用和合并访问
+            *((int4 *)(dst_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) + laneId) =
+                *((int4 *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId);
+        }
+
+        // ========== 同步点6：确保所有数据写入全局内存完成 ==========
+        // 确保当前块的所有数据都已经写入全局内存
+        // 为下一个块的处理做准备
+        __syncthreads();
+    }  // 主循环结束：继续处理下一个128x128块
+}
+
+// =============================================================================
+// KERNEL 2: 简单WMMA GEMM实现（无共享内存优化）
+// =============================================================================
+/*
+ * 功能：执行简单的整数GEMM运算 D = alpha * A * B + beta * C
+ * 
+ * 算法特点：
+ * - 直接从全局内存加载数据，不使用共享内存缓存
+ * - 使用2D网格，每个warp处理一个16x16的输出块
+ * - 沿K维度循环累积部分结果
+ * - 适用于演示WMMA API的基本用法
+ * 
+ * 参数说明：
+ * a: 输入矩阵A (m_ld x k_ld, 行主序, uint8_t类型)
+ * b: 输入矩阵B (k_ld x n_ld, 列主序, uint8_t类型)
+ * c: 输入矩阵C (m_ld x n_ld, 行主序, int类型)
+ * d: 输出矩阵D (m_ld x n_ld, 行主序, int类型)
+ * m_ld, n_ld, k_ld: 矩阵的leading dimensions
+ * alpha, beta: 标量系数
+ * 
+ * 假设条件：
+ * 1) 矩阵在内存中紧密排列
+ * 2) M、N和K都是16的倍数
+ * 3) A和B矩阵都未转置
+ * 
+ * 注意：此函数完全复制自NVIDIA官方CUDA样例，未做任何修改
+ */
+__global__ void simple_wmma_gemm_imma(const uint8_t *a,
+                                      const uint8_t *b,
+                                      const int     *c,
+                                      int           *d,
+                                      int            m_ld,
+                                      int            n_ld,
+                                      int            k_ld,
+                                      int            alpha,
+                                      int            beta)
+{
+    // 矩阵的leading dimensions（紧密排列，无转置）
+    // Leading dimension是指在内存中访问下一行时需要跳过的元素数量
+    int lda = m_ld;  // A矩阵的leading dimension：A是M×K矩阵，行主序存储，每行有K个元素，但lda=m_ld表示整体矩阵布局
+    int ldb = k_ld;  // B矩阵的leading dimension：B是K×N矩阵，列主序存储，ldb表示存储时的跨度
+    int ldc = n_ld;  // C矩阵的leading dimension：C是M×N矩阵，行主序存储，每行有N个元素
+
+    // 使用2D网格进行分块，每个warp负责一个16x16的输出块
+    int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;  // 当前warp在M维度的位置（行索引）
+    int warpN = (blockIdx.y * blockDim.y + threadIdx.y);            // 当前warp在N维度的位置（列索引）
+
+    // 声明WMMA fragments - 这些是寄存器中的抽象数据结构
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, uint8_t, wmma::row_major> a_frag;  // A矩阵fragment（行主序）
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, uint8_t, wmma::col_major> b_frag;  // B矩阵fragment（列主序）
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int>                   acc_frag; // 累加器fragment（存储中间结果）
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, int>                   c_frag;   // C矩阵fragment（用于最终计算）
+
+    // 初始化累加器为0.0f（注意：虽然结果是int类型，但初始化使用float）
+    wmma::fill_fragment(acc_frag, 0.0f);
+
+    // 沿K维度循环，每次处理WMMA_K(16)个元素
+    for (int i = 0; i < k_ld; i += WMMA_K) {
+        // 计算A矩阵当前16x16块在全局矩阵中的位置
+        int aCol = i;                    // A矩阵的列起始位置（K维度）
+        int aRow = warpM * WMMA_M;       // A矩阵的行起始位置（M维度）
+
+        // 计算B矩阵当前16x16块在全局矩阵中的位置
+        int bCol = i;                    // B矩阵的列起始位置（K维度）
+        int bRow = warpN * WMMA_N;       // B矩阵的行起始位置（N维度）
+
+        // 边界检查，确保不会访问超出矩阵边界的内存
+        if (aRow < m_ld && aCol < k_ld && bRow < k_ld && bCol < n_ld) {
+            // 从全局内存加载A和B矩阵的fragments
+            // 地址计算：a + aCol + aRow * lda 表示A[aRow][aCol]的位置
+            wmma::load_matrix_sync(a_frag, a + aCol + aRow * lda, lda);
+            wmma::load_matrix_sync(b_frag, b + bCol + bRow * ldb, ldb);
+
+            // 执行Tensor Core矩阵乘累加运算：acc_frag += a_frag * b_frag
+            wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+        }
+    }
+
+    // 处理C矩阵和最终结果计算
+    int cCol = warpN * WMMA_N;           // C矩阵当前块的列起始位置
+    int cRow = warpM * WMMA_M;           // C矩阵当前块的行起始位置
+
+    if (cRow < m_ld && cCol < n_ld) {
+        // 从全局内存加载C矩阵fragment
+        wmma::load_matrix_sync(c_frag, c + cCol + cRow * ldc, ldc, wmma::mem_row_major);
+
+        // 计算最终结果：D = alpha * (A * B) + beta * C
+        // 对fragment中的每个元素进行点运算
+        for (int i = 0; i < c_frag.num_elements; i++) {
+            c_frag.x[i] = alpha * acc_frag.x[i] + beta * c_frag.x[i];
+        }
+
+        // 将结果存储回全局内存
+        wmma::store_matrix_sync(d + cCol + cRow * ldc, c_frag, ldc, wmma::mem_row_major);
+    }
+}
+
+// =============================================================================
+// CPU参考实现：主机端矩阵乘法
+// =============================================================================
+/*
+ * 功能：在CPU上执行矩阵乘法运算 C = alpha * A * B + beta * C
+ * 
+ * 算法特点：
+ * - 使用经典的三重循环实现，确保结果准确性
+ * - 直接计算，无任何优化，作为GPU实现的"金标准"
+ * - 支持alpha和beta系数的通用GEMM公式
+ * 
+ * 用途：
+ * 1. 作为GPU实现的参考标准，验证计算正确性
+ * 2. 性能对比基准，展示GPU相对于CPU的加速效果
+ * 3. 调试工具，当GPU结果异常时可用于定位问题
+ * 
+ * 实现原理：
+ * - 外层双重循环遍历输出矩阵C的每个元素
+ * - 内层循环计算对应的点积（A的行与B的列）
+ * - 应用GEMM公式的alpha和beta系数
+ * 
+ * 矩阵布局假设：
+ * - A矩阵：行主序存储，维度为 numARows × numAColumns
+ * - B矩阵：列主序存储，但访问时按行主序索引，维度为 numBRows × numBColumns
+ * - C矩阵：行主序存储，维度为 numCRows × numCColumns
+ * 
+ * 参数说明：
+ * A: 输入矩阵A (numARows x numAColumns, uint8_t类型)
+ * B: 输入矩阵B (numBRows x numBColumns, uint8_t类型)
+ * C: 输入输出矩阵C (numCRows x numCColumns, int类型)
+ * alpha, beta: 标量系数
+ * 各种num*参数: 矩阵的行列数
+ * 
+ * 注意：此函数完全复制自NVIDIA官方CUDA样例，未做任何修改
+ */
+__host__ void matMultiplyOnHost(uint8_t *A,
+                                uint8_t *B,
+                                int     *C,
+                                int      alpha,
+                                int      beta,
+                                int      numARows,
+                                int      numAColumns,
+                                int      numBRows,
+                                int      numBColumns,
+                                int      numCRows,
+                                int      numCColumns)
+{
+    // ========== 标准矩阵乘法三重循环实现 ==========
+    // 算法复杂度：O(numCRows × numCColumns × numAColumns)
+    // 这是最直接、最容易理解的矩阵乘法实现
+    
+    // 外层循环：遍历输出矩阵C的每一行
+    for (int i = 0; i < numCRows; i++) {
+        
+        // 中层循环：遍历输出矩阵C的每一列
+        for (int j = 0; j < numCColumns; j++) {
+            
+            // ========== 点积计算初始化 ==========
+            // temp用于累积A的第i行与B的第j列的点积结果
+            int temp = 0;
+
+            // ========== 内层循环：计算点积 ==========
+            // 计算A矩阵第i行与B矩阵第j列的点积
+            // 这是矩阵乘法的核心运算：∑(A[i,k] * B[k,j])
+            for (int k = 0; k < numAColumns; k++) {
+                
+                // ========== 关键的内存访问模式 ==========
+                // A[i * numAColumns + k]：A矩阵第i行第k列元素（行主序访问）
+                // B[j * numBRows + k]：B矩阵第j列第k行元素
+                // 
+                // 注意B矩阵的索引：
+                // - B在内存中可能是列主序存储
+                // - 但这里的访问模式是 B[j * numBRows + k]
+                // - 对应于转置后的访问，即 B^T[j,k] = B[k,j]
+                temp += A[i * numAColumns + k] * B[j * numBRows + k];
+            }
+
+            // ========== GEMM公式应用 ==========
+            // 实现完整的GEMM公式：C = alpha * A * B + beta * C
+            // 
+            // 计算步骤：
+            // 1. temp：包含 (A * B)[i,j] 的结果
+            // 2. temp * alpha：应用alpha系数到乘积结果
+            // 3. beta * C[i * numCColumns + j]：应用beta系数到原C矩阵元素
+            // 4. 最终结果：alpha * (A*B)[i,j] + beta * C[i,j]
+            // 
+            // 内存访问：C[i * numCColumns + j] 表示C矩阵第i行第j列（行主序）
+            C[i * numCColumns + j] = temp * alpha + beta * C[i * numCColumns + j];
+        }
+    }
+}
+
+// =============================================================================
+// 辅助函数：主机端矩阵初始化（来自官方代码）
+// =============================================================================
+/*
+ * 功能：初始化主机端的A、B、C矩阵
+ * 使用小的随机值（0-2）确保不会溢出并便于调试
+ */
+__host__ void init_host_matrices(uint8_t *a, uint8_t *b, int *c, int M_size, int N_size, int K_size)
+{
+    // 初始化A矩阵 (M_size x K_size)
+    for (int i = 0; i < M_size; i++) {
+        for (int j = 0; j < K_size; j++) {
+            a[i * K_size + j] = (uint8_t)(rand() % 3);
+        }
+    }
+
+    // 初始化B矩阵 (N_size x K_size，以列主序存储）
+    for (int i = 0; i < N_size; i++) {
+        for (int j = 0; j < K_size; j++) {
+            b[i * K_size + j] = (uint8_t)(rand() % 3);
+        }
+    }
+
+    // 初始化C矩阵 (M_size x N_size)
+    for (int t = 0; t < M_size * N_size; t++) {
+        c[t] = (rand() % 3);
+    }
+}
+
+// =============================================================================
+// 测试类型枚举
+// =============================================================================
+
+// 枚举类型：选择要运行的kernel
+enum GemmKernelType {
+    SIMPLE,     // 简单WMMA实现
+    OPTIMIZED   // 优化的共享内存实现
+};
+
+// =============================================================================
+// 主函数：执行性能基准测试
+// =============================================================================
+int main(int argc, char **argv)
+{
+    printf("=== IMMA Tensor Core GEMM 性能基准测试 ===\n");
+    
+    // 查找并初始化CUDA设备
+    int dev = findCudaDevice(argc, (const char **)argv);
+    cudaDeviceProp deviceProp;
+    checkCudaErrors(cudaGetDeviceProperties(&deviceProp, dev));
+
+    // 检查GPU是否支持Tensor Core（需要SM 7.2或更高版本）
+    if (deviceProp.major < 7 || (deviceProp.major <= 7 && deviceProp.minor < 2)) {
+        printf("错误：IMMA Tensor Core需要SM 7.2或更高版本的GPU。程序退出...\n");
+        exit(EXIT_WAIVED);
+    }
+
+    printf("GPU设备信息: %s (SM %d.%d)\n", deviceProp.name, deviceProp.major, deviceProp.minor);
+    printf("多处理器数量: %d\n", deviceProp.multiProcessorCount);
+    printf("最大共享内存: %d KB\n", deviceProp.sharedMemPerBlock / 1024);
+
+    // 定义要测试的矩阵维度
+    std::vector<int> test_sizes = {512, 768, 1024, 1536, 2048, 2560, 3072, 4096, 8192, 16384};
+    printf("测试矩阵维度: ");
+    for (size_t i = 0; i < test_sizes.size(); i++) {
+        printf("%d", test_sizes[i]);
+        if (i < test_sizes.size() - 1) printf(", ");
+    }
+    printf("\n\n");
+
+    // 设置alpha和beta系数
+    int alpha = 1;
+    int beta = 1;
+    printf("GEMM公式: D = %d * A * B + %d * C\n", alpha, beta);
+
+    // 性能数据收集结构
+    struct PerfData {
+        int size;
+        float time_simple;
+        float time_optimized;
+        double time_cpu;
+        double tops_simple;
+        double tops_optimized;
+        double tops_cpu;
+        bool optimized_executed;
+        bool results_match;
+    };
+    std::vector<PerfData> perf_results;
+
+    // 对每个测试维度进行三种GEMM实现的测试和比较
+    for (int size : test_sizes) {
+        printf("\n" + std::string(60, '=') + "\n");
+        printf("测试矩阵维度: %d x %d x %d\n", size, size, size);
+        printf(std::string(60, '=') + "\n");
+
+        // 检查维度是否满足WMMA要求
+        if (size % 16 != 0) {
+            printf("跳过: 矩阵维度必须是16的倍数才能使用WMMA\n");
+            continue;
+        }
+
+        // 分配主机内存
+        size_t bytes_a = (size_t)size * size * sizeof(uint8_t);
+        size_t bytes_b = (size_t)size * size * sizeof(uint8_t);
+        size_t bytes_c = (size_t)size * size * sizeof(int);
+        size_t bytes_d = (size_t)size * size * sizeof(int);
+
+        uint8_t *h_a = (uint8_t *)malloc(bytes_a);
+        uint8_t *h_b = (uint8_t *)malloc(bytes_b);
+        int *h_c = (int *)malloc(bytes_c);
+        int *h_d_gpu_simple = (int *)malloc(bytes_d);     // 简单GPU实现结果
+        int *h_d_gpu_optimized = (int *)malloc(bytes_d);  // 优化GPU实现结果
+        int *h_d_cpu = (int *)malloc(bytes_d);            // CPU参考实现结果
+
+        // 检查主机内存分配是否成功
+        if (!h_a || !h_b || !h_c || !h_d_gpu_simple || !h_d_gpu_optimized || !h_d_cpu) {
+            printf("错误: 主机内存分配失败\n");
+            exit(EXIT_FAILURE);
+        }
+
+        // 初始化输入矩阵
+        printf("正在初始化输入矩阵...\n");
+        init_host_matrices(h_a, h_b, h_c, size, size, size);
+
+        // 分配GPU内存
+        uint8_t *d_a, *d_b;
+        int *d_c, *d_d;
+        checkCudaErrors(cudaMalloc(&d_a, bytes_a));
+        checkCudaErrors(cudaMalloc(&d_b, bytes_b));
+        checkCudaErrors(cudaMalloc(&d_c, bytes_c));
+        checkCudaErrors(cudaMalloc(&d_d, bytes_d));
+
+        // 复制数据到GPU
+        checkCudaErrors(cudaMemcpy(d_a, h_a, bytes_a, cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMemcpy(d_b, h_b, bytes_b, cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMemcpy(d_c, h_c, bytes_c, cudaMemcpyHostToDevice));
+
+        // 计算总操作数 (每个乘加操作算2个ops) - 按照官方代码公式
+        double ops = (double)size * size * size * 2;
+
+        // 性能数据变量声明
+        float time_simple = 0, time_optimized = 0;
+        double tops_simple = 0, tops_optimized = 0;
+        double cpu_time_ms = 0, tops_cpu = 0;
+        bool simple_vs_cpu_match = true, optimized_vs_cpu_match = true;
+
+        // =============================================================================
+        // 测试1: 简单WMMA实现
+        // =============================================================================
+        printf("\n[测试1] 简单WMMA GEMM实现\n");
+        checkCudaErrors(cudaMemset(d_d, 0, bytes_d));
+
+        // 配置grid和block (参考官方代码)
+        dim3 gridDim, blockDim;
+        blockDim.x = 128;  // blockDim.x必须是warpSize的倍数
+        blockDim.y = 4;    // 128x4意味着16个warp，一个block计算64x64输出块
+        
+        gridDim.x = (size + (WMMA_M * blockDim.x / 32 - 1)) / (WMMA_M * blockDim.x / 32);
+        gridDim.y = (size + WMMA_N * blockDim.y - 1) / (WMMA_N * blockDim.y);
+
+        printf("Grid配置: (%d, %d), Block配置: (%d, %d)\n", 
+               gridDim.x, gridDim.y, blockDim.x, blockDim.y);
+
+        // 创建CUDA事件用于精确时间测量
+        cudaEvent_t start, stop;
+        checkCudaErrors(cudaEventCreate(&start));
+        checkCudaErrors(cudaEventCreate(&stop));
+        
+        // 记录开始时间
+        checkCudaErrors(cudaEventRecord(start));
+        
+        // 执行简单kernel
+        simple_wmma_gemm_imma<<<gridDim, blockDim>>>(d_a, d_b, d_c, d_d, size, size, size, alpha, beta);
+        checkKernelErrors(("simple_wmma_gemm_imma kernel execution failed"));
+        
+        // 记录结束时间
+        checkCudaErrors(cudaEventRecord(stop));
+        checkCudaErrors(cudaEventSynchronize(stop));  // 确保GPU完成
+
+        checkCudaErrors(cudaEventElapsedTime(&time_simple, start, stop));
+        checkCudaErrors(cudaMemcpy(h_d_gpu_simple, d_d, bytes_d, cudaMemcpyDeviceToHost));
+
+        // 计算性能指标 (严格按照官方代码公式)
+        tops_simple = (ops / (time_simple / 1000.0)) / 1e12;
+        printf("执行时间: %.3f ms, 性能: %.2f TOPS\n", time_simple, tops_simple);
+
+        // =============================================================================
+        // 测试2: 优化WMMA实现（带共享内存）
+        // =============================================================================
+        printf("\n[测试2] 优化WMMA GEMM实现（共享内存优化）\n");
+        
+        // 检查共享内存要求（无论矩阵大小如何都尝试运行以观察性能差异）
+        if (size % 128 != 0) {
+            printf("注意: 矩阵维度(%d)不是128的倍数，可能存在性能衰减\n", size);
+        }
+        
+        checkCudaErrors(cudaMemset(d_d, 0, bytes_d));
+
+            // 计算共享内存大小 (严格按照官方代码)
+            enum {
+                SHMEM_SZ = MAX(sizeof(uint8_t) * (BLOCK_COL_TILES * M) * (CHUNK_K * K + SKEW_UINT8) * 2,
+                               M * (BLOCK_ROW_WARPS * WARP_ROW_TILES) * N * (BLOCK_COL_WARPS * WARP_COL_TILES) * sizeof(int))
+            };
+            printf("所需共享内存: %lu KB\n", SHMEM_SZ / 1024UL);
+
+            // 检查共享内存是否足够
+            if (deviceProp.sharedMemPerMultiprocessor >= SHMEM_SZ) {
+                printf("使用高性能kernel compute_gemm_imma\n");
+                
+                // 设置动态共享内存大小
+                checkCudaErrors(cudaFuncSetAttribute(compute_gemm_imma, 
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, SHMEM_SZ));
+                
+                // 记录开始时间
+                checkCudaErrors(cudaEventRecord(start));
+                
+                // 执行优化kernel (严格按照官方代码的启动配置)
+                checkKernelErrors((compute_gemm_imma<<<deviceProp.multiProcessorCount, THREADS_PER_BLOCK, SHMEM_SZ>>>(
+                    d_a, d_b, d_c, d_d, alpha, beta)));
+                
+                // 记录结束时间
+                checkCudaErrors(cudaEventRecord(stop));
+                checkCudaErrors(cudaEventSynchronize(stop));  // 确保GPU完成
+
+                checkCudaErrors(cudaEventElapsedTime(&time_optimized, start, stop));
+                checkCudaErrors(cudaMemcpy(h_d_gpu_optimized, d_d, bytes_d, cudaMemcpyDeviceToHost));
+
+                // 计算性能指标 (严格按照官方代码公式)
+                tops_optimized = (ops / (time_optimized / 1000.0)) / 1e12;
+                printf("执行时间: %.3f ms, 性能: %.2f TOPS\n", time_optimized, tops_optimized);
+                
+                if (time_simple > 0) {
+                    printf("相对于简单版本加速比: %.2fx\n", time_simple / time_optimized);
+                }
+            } else {
+                printf("跳过: 共享内存不足，需要 %lu KB，可用 %d KB\n", 
+                       SHMEM_SZ / 1024UL, deviceProp.sharedMemPerMultiprocessor / 1024);
+                memset(h_d_gpu_optimized, 0, bytes_d);
+            }
+
+        // =============================================================================
+        // 测试3: CPU参考实现
+        // =============================================================================
+        printf("\n[测试3] CPU参考实现\n");
+        
+        // 复制C矩阵用于CPU计算 (D = alpha * A * B + beta * C)
+        memcpy(h_d_cpu, h_c, bytes_d);
+        
+        // 使用CPU时钟测量 (因为CPU计算不需要事件同步)
+        auto cpu_start = std::chrono::high_resolution_clock::now();
+        matMultiplyOnHost(h_a, h_b, h_d_cpu, alpha, beta, size, size, size, size, size, size);
+        auto cpu_end = std::chrono::high_resolution_clock::now();
+        
+        auto cpu_duration = std::chrono::duration_cast<std::chrono::milliseconds>(cpu_end - cpu_start);
+        cpu_time_ms = cpu_duration.count();
+        tops_cpu = (ops / (cpu_time_ms / 1000.0)) / 1e12;
+        printf("执行时间: %.0f ms, 性能: %.4f TOPS\n", cpu_time_ms, tops_cpu);
+        
+        if (time_simple > 0) {
+            printf("GPU简单版本相对CPU加速比: %.1fx\n", cpu_time_ms / time_simple);
+        }
+
+        // =============================================================================
+        // 结果验证
+        // =============================================================================
+        printf("\n[结果验证] 比较三种实现的输出\n");
+        
+        // 比较GPU简单版本与CPU
+        simple_vs_cpu_match = true;
+        int max_errors_to_show = 10;
+        int error_count = 0;
+        
+        for (int i = 0; i < size * size && error_count < max_errors_to_show; i++) {
+            if (abs(h_d_gpu_simple[i] - h_d_cpu[i]) > 0) {
+                if (error_count == 0) {
+                    printf("简单GPU vs CPU 不匹配:\n");
+                }
+                printf("  位置[%d]: GPU_简单=%d, CPU=%d\n", i, h_d_gpu_simple[i], h_d_cpu[i]);
+                simple_vs_cpu_match = false;
+                error_count++;
+            }
+        }
+        if (simple_vs_cpu_match) {
+            printf("✓ 简单GPU实现与CPU参考实现匹配\n");
+        } else {
+            printf("✗ 简单GPU实现与CPU参考实现不匹配 (显示前%d个错误)\n", max_errors_to_show);
+        }
+
+        // 比较GPU优化版本与CPU（如果优化版本执行了）
+        // 重新计算共享内存大小用于验证是否执行了优化版本
+        size_t SHMEM_SZ = MAX(sizeof(uint8_t) * (BLOCK_COL_TILES * M) * (CHUNK_K * K + SKEW_UINT8) * 2,
+                              M * (BLOCK_ROW_WARPS * WARP_ROW_TILES) * N * (BLOCK_COL_WARPS * WARP_COL_TILES) * sizeof(int));
+        
+        if (deviceProp.sharedMemPerMultiprocessor >= SHMEM_SZ) {
+            optimized_vs_cpu_match = true;
+            error_count = 0;
+            
+            for (int i = 0; i < size * size && error_count < max_errors_to_show; i++) {
+                if (abs(h_d_gpu_optimized[i] - h_d_cpu[i]) > 0) {
+                    if (error_count == 0) {
+                        printf("优化GPU vs CPU 不匹配:\n");
+                    }
+                    printf("  位置[%d]: GPU_优化=%d, CPU=%d\n", i, h_d_gpu_optimized[i], h_d_cpu[i]);
+                    optimized_vs_cpu_match = false;
+                    error_count++;
+                }
+            }
+            if (optimized_vs_cpu_match) {
+                printf("✓ 优化GPU实现与CPU参考实现匹配\n");
+            } else {
+                printf("✗ 优化GPU实现与CPU参考实现不匹配 (显示前%d个错误)\n", max_errors_to_show);
+            }
+        } else {
+            printf("说明: 优化版本因共享内存不足未执行，无法比较\n");
+        }
+
+        // 清理内存
+        free(h_a);
+        free(h_b);
+        free(h_c);
+        free(h_d_gpu_simple);
+        free(h_d_gpu_optimized);
+        free(h_d_cpu);
+        
+        checkCudaErrors(cudaFree(d_a));
+        checkCudaErrors(cudaFree(d_b));
+        checkCudaErrors(cudaFree(d_c));
+        checkCudaErrors(cudaFree(d_d));
+        
+        // 清理CUDA事件
+        checkCudaErrors(cudaEventDestroy(start));
+        checkCudaErrors(cudaEventDestroy(stop));
+
+        // 收集性能数据用于汇总分析
+        PerfData current_perf;
+        current_perf.size = size;
+        current_perf.time_simple = time_simple;
+        current_perf.tops_simple = tops_simple;
+        current_perf.time_cpu = cpu_time_ms;
+        current_perf.tops_cpu = tops_cpu;
+        
+        // 检查优化版本是否执行了
+        size_t SHMEM_SZ_FINAL = MAX(sizeof(uint8_t) * (BLOCK_COL_TILES * M) * (CHUNK_K * K + SKEW_UINT8) * 2,
+                                    M * (BLOCK_ROW_WARPS * WARP_ROW_TILES) * N * (BLOCK_COL_WARPS * WARP_COL_TILES) * sizeof(int));
+        current_perf.optimized_executed = (deviceProp.sharedMemPerMultiprocessor >= SHMEM_SZ_FINAL);
+        
+        if (current_perf.optimized_executed) {
+            current_perf.time_optimized = time_optimized;
+            current_perf.tops_optimized = tops_optimized;
+        } else {
+            current_perf.time_optimized = 0;
+            current_perf.tops_optimized = 0;
+        }
+        
+        // 检查结果是否匹配
+        current_perf.results_match = simple_vs_cpu_match && (current_perf.optimized_executed ? optimized_vs_cpu_match : true);
+        
+        perf_results.push_back(current_perf);
+    }
+
+    // =============================================================================
+    // 性能分析汇总报告
+    // =============================================================================
+    printf("\n" + std::string(80, '=') + "\n");
+    printf("性能分析汇总报告\n");
+    printf(std::string(80, '=') + "\n");
+
+    // 输出表格格式的性能对比
+    printf("\n%-8s %-12s %-12s %-12s %-8s %-8s %-8s %-10s\n", 
+           "矩阵大小", "简单版本", "优化版本", "CPU版本", "简单TOPS", "优化TOPS", "CPU TOPS", "结果匹配");
+    printf("%-8s %-12s %-12s %-12s %-8s %-8s %-8s %-10s\n", 
+           "--------", "----------", "----------", "----------", "--------", "--------", "--------", "----------");
+    
+    for (const auto& perf : perf_results) {
+        char opt_time_str[16], opt_tops_str[16];
+        if (perf.optimized_executed) {
+            sprintf(opt_time_str, "%.3f", perf.time_optimized);
+            sprintf(opt_tops_str, "%.2f", perf.tops_optimized);
+        } else {
+            strcpy(opt_time_str, "跳过");
+            strcpy(opt_tops_str, "N/A");
+        }
+        
+        printf("%-8d %-12.3f %-12s %-12.0f %-8.2f %-8s %-8.4f %-10s\n",
+               perf.size,
+               perf.time_simple,
+               opt_time_str,
+               perf.time_cpu,
+               perf.tops_simple,
+               opt_tops_str,
+               perf.tops_cpu,
+               perf.results_match ? "✓" : "✗");
+    }
+
+    // 找出最佳性能
+    auto best_simple = std::max_element(perf_results.begin(), perf_results.end(),
+                                        [](const PerfData& a, const PerfData& b) {
+                                            return a.tops_simple < b.tops_simple;
+                                        });
+    
+    auto best_optimized = std::max_element(perf_results.begin(), perf_results.end(),
+                                           [](const PerfData& a, const PerfData& b) {
+                                               if (!a.optimized_executed) return true;
+                                               if (!b.optimized_executed) return false;
+                                               return a.tops_optimized < b.tops_optimized;
+                                           });
+
+    printf("\n性能分析结果:\n");
+    printf("• 简单版本最佳性能: %.2f TOPS (矩阵大小: %d)\n", 
+           best_simple->tops_simple, best_simple->size);
+    
+    if (best_optimized->optimized_executed) {
+        printf("• 优化版本最佳性能: %.2f TOPS (矩阵大小: %d)\n", 
+               best_optimized->tops_optimized, best_optimized->size);
+        printf("• 优化版本相对简单版本最大加速比: %.2fx\n", 
+               best_optimized->tops_optimized / best_simple->tops_simple);
+    }
+
+    // 分析128倍数的性能差异
+    printf("\n128倍数对齐性能分析:\n");
+    double avg_aligned = 0, avg_unaligned = 0;
+    int count_aligned = 0, count_unaligned = 0;
+    
+    for (const auto& perf : perf_results) {
+        if (!perf.optimized_executed) continue;
+        if (perf.size % 128 == 0) {
+            avg_aligned += perf.tops_optimized;
+            count_aligned++;
+        } else {
+            avg_unaligned += perf.tops_optimized;
+            count_unaligned++;
+        }
+    }
+    
+    if (count_aligned > 0 && count_unaligned > 0) {
+        avg_aligned /= count_aligned;
+        avg_unaligned /= count_unaligned;
+        printf("• 128对齐平均性能: %.2f TOPS (%d个测试)\n", avg_aligned, count_aligned);
+        printf("• 非128对齐平均性能: %.2f TOPS (%d个测试)\n", avg_unaligned, count_unaligned);
+        printf("• 性能衰减: %.1f%%\n", (avg_aligned - avg_unaligned) / avg_aligned * 100);
+    }
+
+    // 输出CSV文件用于进一步分析
+    FILE* csv_file = fopen("imma_performance_results.csv", "w");
+    if (csv_file) {
+        fprintf(csv_file, "Matrix_Size,Simple_Time_ms,Optimized_Time_ms,CPU_Time_ms,Simple_TOPS,Optimized_TOPS,CPU_TOPS,Optimized_Executed,Results_Match,Is_128_Aligned,Speedup_vs_Simple\n");
+        
+        for (const auto& perf : perf_results) {
+            double speedup = perf.optimized_executed ? (perf.time_simple / perf.time_optimized) : 0;
+            fprintf(csv_file, "%d,%.3f,%.3f,%.0f,%.6f,%.6f,%.6f,%s,%s,%s,%.2f\n",
+                    perf.size,
+                    perf.time_simple,
+                    perf.optimized_executed ? perf.time_optimized : 0,
+                    perf.time_cpu,
+                    perf.tops_simple,
+                    perf.optimized_executed ? perf.tops_optimized : 0,
+                    perf.tops_cpu,
+                    perf.optimized_executed ? "Yes" : "No",
+                    perf.results_match ? "Yes" : "No",
+                    (perf.size % 128 == 0) ? "Yes" : "No",
+                    speedup);
+        }
+        fclose(csv_file);
+        printf("\n性能数据已保存到: imma_performance_results.csv\n");
+    }
+
+    printf("\n" + std::string(80, '=') + "\n");
+    printf("所有测试完成！\n");
+    printf(std::string(80, '=') + "\n");
+    
+    return EXIT_SUCCESS;
+}

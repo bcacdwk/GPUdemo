@@ -1,7 +1,0 @@
-Kernel,M,N,K,Latency(ms),TOPS,Bandwidth(GB/s)
-simple_wmma_gemm,1024,1024,1024,1.37656,1.56003,7.61735
-optimized_wmma_gemm,1024,1024,1024,1.34687,1.59443,7.7853
-simple_wmma_gemm,4096,4096,4096,45.4692,3.02268,3.6898
-optimized_wmma_gemm,4096,4096,4096,1.05001,130.893,159.782
-simple_wmma_gemm,8192,8192,8192,332.603,3.30578,2.01769
-optimized_wmma_gemm,8192,8192,8192,1.33233,825.257,503.697

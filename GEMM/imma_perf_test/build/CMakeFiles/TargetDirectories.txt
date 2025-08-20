@@ -1,3 +1,0 @@
-/home/yanxia/hanyong/GPUdemo/GEMM/imma_perf_test/build/CMakeFiles/imma_perf_test.dir
-/home/yanxia/hanyong/GPUdemo/GEMM/imma_perf_test/build/CMakeFiles/edit_cache.dir
-/home/yanxia/hanyong/GPUdemo/GEMM/imma_perf_test/build/CMakeFiles/rebuild_cache.dir
