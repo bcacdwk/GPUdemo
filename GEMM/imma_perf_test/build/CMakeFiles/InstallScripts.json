@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/yanxia/hanyong/GPUdemo/GEMM/imma_perf_test/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

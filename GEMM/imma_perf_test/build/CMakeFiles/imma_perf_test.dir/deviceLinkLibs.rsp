@@ -1,0 +1,1 @@
+ "/usr/local/cuda-12.2/lib64/libcudart_static.a" -ldl  -lpthread -lcudadevrt -lcudart_static -lrt 
