@@ -23,7 +23,7 @@ void add(int n, float *x, float *y)
 
 int main(void)
 {
-    int N = 1 << 30;
+    int N = 1 << 20;
     size_t bytes = N * sizeof(float);
 
 

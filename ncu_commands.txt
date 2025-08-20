@@ -1,0 +1,22 @@
+# NCU性能分析命令集合
+
+# 基本详细分析命令（推荐使用）
+sudo /usr/local/cuda-12.2/bin/ncu --set detailed --csv --log-file analysis.csv --force-overwrite ./你的程序名
+
+# 更详细的分析命令
+sudo /usr/local/cuda-12.2/bin/ncu --set full --csv --log-file full_analysis.csv --force-overwrite ./你的程序名
+
+# 指定特定指标的分析
+sudo /usr/local/cuda-12.2/bin/ncu --metrics sm__cycles_elapsed.avg,dram__throughput.avg.pct_of_peak_sustained_elapsed --csv --log-file metrics.csv ./你的程序名
+
+# 分析特定kernel的命令
+sudo /usr/local/cuda-12.2/bin/ncu --kernel-name add --set detailed --csv --log-file kernel_analysis.csv ./你的程序名
+
+# 使用示例：
+# 1. 先编译你的程序: nvcc -o add add.cu
+# 2. 运行分析: sudo /usr/local/cuda-12.2/bin/ncu --set detailed --csv --log-file add_analysis.csv --force-overwrite ./add
+# 3. 查看结果: head -20 add_analysis.csv
+
+
+
+sudo /usr/local/cuda-12.2/bin/ncu --set full --csv --log-file .csv --force-overwrite ./
