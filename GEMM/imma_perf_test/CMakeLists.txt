@@ -1,19 +1,31 @@
-cmake_minimum_required(VERSION 3.12)
-project(imma_perf_test LANGUAGES CXX CUDA)
+cmake_minimum_required(VERSION 3.20)
 
-# Find CUDA and add the required libraries
-find_package(CUDA REQUIRED)
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake/Modules")
 
-# Add the Common directory from CUDAsampleSHY for helper files
-include_directories("../../../CUDAsampleSHY/Common")
+project(imma LANGUAGES C CXX CUDA)
 
-# Add the executable
-add_executable(imma_perf_test imma_perf_test.cu)
+find_package(CUDAToolkit REQUIRED)
 
-# Target specific CUDA properties
-set_target_properties(imma_perf_test PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Link CUDA libraries
-target_link_libraries(imma_perf_test PRIVATE ${CUDA_LIBRARIES})
+set(CMAKE_CUDA_ARCHITECTURES 75 80 86 87 89 90)
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-deprecated-gpu-targets")
+
+if(ENABLE_CUDA_DEBUG)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G")        # enable cuda-gdb (may significantly affect performance on some targets)
+else()
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo") # add line information to all builds for debug tools (exclusive to -G option)
+endif()
+
+# Include directories and libraries
+include_directories(../../../CUDAsampleSHY/Common)
+
+# Source file
+# Add target for immaTensorCoreGemm
+add_executable(imma imma.cu)
+
+target_compile_options(imma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
+
+target_compile_features(imma PRIVATE cxx_std_17 cuda_std_17)
+
+set_target_properties(imma PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

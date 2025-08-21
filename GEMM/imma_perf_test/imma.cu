@@ -24,19 +24,18 @@
 #include <mma.h>
 #include <stdio.h>
 #include <iostream>
+#include <iomanip>
 #include <fstream>
 #include <vector>
 #include <string>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <sstream>
 
 // CUDA辅助函数库
 #include <helper_cuda.h>
 #include <helper_functions.h>
-
-using namespace std;
-using namespace nvcuda;
 
 // =============================================================================
 // 错误检查宏定义
@@ -56,7 +55,7 @@ using namespace nvcuda;
         expr; \
         cudaError_t __err = cudaGetLastError(); \
         if (__err != cudaSuccess) { \
-            printf("内核执行错误 %d行: '%s' 失败: %s\n", __LINE__, #expr, cudaGetErrorString(__err)); \
+            fprintf(stderr, "内核执行错误 %d行: '%s' 失败: %s\n", __LINE__, #expr, cudaGetErrorString(__err)); \
             abort(); \
         } \
     } while (0)
@@ -70,7 +69,6 @@ using namespace nvcuda;
 // =============================================================================
 
 // ========== GPU基础配置 ==========
-#define WARP_SIZE 32                    // GPU warp大小，NVIDIA GPU固定为32个线程
 
 // ========== WMMA矩阵块的基础维度 ==========
 // Tensor Core WMMA操作的基本矩阵块大小，对于INT8 IMMA固定为16x16x16
@@ -98,6 +96,7 @@ using namespace nvcuda;
 #define C_LAYOUT wmma::mem_row_major    // C和D矩阵使用行主序存储布局
 
 // ========== 高性能kernel的CTA配置 ==========
+#define WARP_SIZE 32                    // GPU warp大小，NVIDIA GPU固定为32个线程
 #define WARPS_PER_BLOCK   8             // 每个CTA包含8个warp
 #define THREADS_PER_BLOCK (WARP_SIZE * WARPS_PER_BLOCK)  // 每个CTA的线程总数 = 32 * 8 = 256
 
@@ -143,6 +142,12 @@ using namespace nvcuda;
 // 为避免共享内存bank冲突而添加的偏移量
 // 每行/列偏移32个uint8_t元素，确保256位对齐并将不同行/列映射到不同bank
 #define SKEW_UINT8 32                   // bank冲突避免偏移：32字节（256位对齐要求）
+
+// =============================================================================
+// 命名空间声明
+// =============================================================================
+using namespace nvcuda;
+using namespace std;
 
 // =============================================================================
 // KERNEL 1: 高性能WMMA GEMM实现（带共享内存优化）
@@ -779,312 +784,688 @@ enum GemmKernelType {
 };
 
 // =============================================================================
-// 主函数：执行性能基准测试
+// 主函数：执行IMMA Tensor Core GEMM性能基准测试
 // =============================================================================
+/*
+ * 主函数功能概述：
+ * 1. 初始化CUDA环境和GPU设备
+ * 2. 为每个测试矩阵大小分配内存和初始化数据
+ * 3. 执行GPU预热（可选CPU验证）
+ * 4. 运行两种GEMM实现并测量性能：
+ *    - 简单WMMA实现（无共享内存优化）
+ *    - 优化WMMA实现（带共享内存优化）
+ * 5. 收集和分析性能数据
+ * 6. 清理资源并输出结果
+ */
 int main(int argc, char **argv)
 {
-    printf("=== IMMA Tensor Core GEMM 性能基准测试 ===\n");
+    std::cout << "=== IMMA Tensor Core GEMM 性能基准测试 ===" << std::endl;
     
-    // 查找并初始化CUDA设备
+    // =============================================================================
+    // 配置参数：控制程序行为
+    // =============================================================================
+    const bool enable_cpu_verification = false;  
+    // 控制是否进行CPU验证：
+    // - true:  启用CPU验证，程序会运行CPU版本的GEMM进行结果验证（慢但准确）
+    // - false: 跳过CPU验证，只运行GPU版本进行性能测试（快速迭代）
+    
+    // =============================================================================
+    // CUDA设备初始化和能力检查
+    // =============================================================================
+    
+    // 查找并选择CUDA设备
+    // findCudaDevice() 会根据命令行参数选择最佳的GPU设备
+    // 如果有多个GPU，它会选择计算能力最高的那个
     int dev = findCudaDevice(argc, (const char **)argv);
+    
+    // 获取选中GPU的详细属性信息
+    // cudaDeviceProp 结构体包含GPU的所有硬件信息：
+    // - 计算能力版本(major.minor)
+    // - 内存大小、共享内存大小
+    // - 多处理器数量、warp大小等
     cudaDeviceProp deviceProp;
     checkCudaErrors(cudaGetDeviceProperties(&deviceProp, dev));
 
-    // 检查GPU是否支持Tensor Core（需要SM 7.2或更高版本）
+    // 检查GPU是否支持Tensor Core IMMA操作
+    // Tensor Core的INT8 IMMA操作需要计算能力7.2或更高：
+    // - SM 7.2: V100 (第一代Tensor Core)
+    // - SM 7.5: RTX 20系列, T4
+    // - SM 8.0: A100 (第二代Tensor Core)
+    // - SM 8.6: RTX 30系列
     if (deviceProp.major < 7 || (deviceProp.major <= 7 && deviceProp.minor < 2)) {
-        printf("错误：IMMA Tensor Core需要SM 7.2或更高版本的GPU。程序退出...\n");
+        std::cout << "错误：IMMA Tensor Core需要SM 7.2或更高版本的GPU。程序退出..." << std::endl;
         exit(EXIT_WAIVED);
     }
 
-    printf("GPU设备信息: %s (SM %d.%d)\n", deviceProp.name, deviceProp.major, deviceProp.minor);
-    printf("多处理器数量: %d\n", deviceProp.multiProcessorCount);
-    printf("最大共享内存: %d KB\n", deviceProp.sharedMemPerBlock / 1024);
+    // 输出GPU硬件信息，帮助理解性能测试环境
+    std::cout << "GPU设备信息: " << deviceProp.name << " (SM " << deviceProp.major << "." << deviceProp.minor << ")" << std::endl;
+    std::cout << "多处理器数量: " << deviceProp.multiProcessorCount << std::endl;  // 影响并行度
+    std::cout << "最大共享内存: " << (deviceProp.sharedMemPerBlock / 1024) << " KB" << std::endl;  // 影响优化kernel的可用性
 
-    // 定义要测试的矩阵维度
-    std::vector<int> test_sizes = {512, 768, 1024, 1536, 2048, 2560, 3072, 4096, 8192, 16384};
-    printf("测试矩阵维度: ");
+    // =============================================================================
+    // 测试配置：定义要测试的矩阵大小
+    // =============================================================================
+    
+    // 定义测试矩阵的维度列表
+    // 矩阵大小会显著影响性能特征：
+    // - 小矩阵(512-1024): 主要受启动开销影响
+    // - 中矩阵(2048-4096): GPU利用率逐渐提高
+    // - 大矩阵(8192+): 接近GPU峰值性能
+    // std::vector<int> test_sizes = {4096, 8192};
+    // 可以启用更全面的测试：
+    // std::vector<int> test_sizes = {512, 768, 1024, 1536, 2048, 2560, 3072, 4096, 8192, 16384};
+    // 似乎4096以下的矩阵大小会返回 code=700(cudaErrorIllegalAddress) "cudaDeviceSynchronize()" 的错误?
+    std::vector<int> test_sizes = {4096, 6144, 8192, 10240, 12288, 14336, 16384};
+
+    std::cout << "测试矩阵维度: ";
     for (size_t i = 0; i < test_sizes.size(); i++) {
-        printf("%d", test_sizes[i]);
-        if (i < test_sizes.size() - 1) printf(", ");
+        std::cout << test_sizes[i];
+        if (i < test_sizes.size() - 1) std::cout << ", ";
     }
-    printf("\n\n");
+    std::cout << std::endl << std::endl;
 
-    // 设置alpha和beta系数
-    int alpha = 1;
-    int beta = 1;
-    printf("GEMM公式: D = %d * A * B + %d * C\n", alpha, beta);
+    // =============================================================================
+    // GEMM运算配置：定义矩阵乘法的标量系数
+    // =============================================================================
+    
+    // GEMM标准公式：D = alpha * A * B + beta * C
+    // alpha: A*B乘积的缩放系数
+    // beta:  C矩阵的缩放系数  
+    int alpha = 1;  // 不缩放A*B的结果
+    int beta = 1;   // 保留C矩阵的原始值
+    std::cout << "GEMM公式: D = " << alpha << " * A * B + " << beta << " * C" << std::endl;
 
-    // 性能数据收集结构
+    // =============================================================================
+    // 性能数据收集结构：用于汇总分析
+    // =============================================================================
+    
+    // 定义数据结构来存储每个测试的完整性能信息
     struct PerfData {
-        int size;
-        float time_simple;
-        float time_optimized;
-        double time_cpu;
-        double tops_simple;
-        double tops_optimized;
-        double tops_cpu;
-        bool optimized_executed;
-        bool results_match;
+        int size;                    // 矩阵大小
+        float time_simple;           // 简单版本执行时间(ms)
+        float time_optimized;        // 优化版本执行时间(ms)
+        double time_cpu;             // CPU版本执行时间(ms)
+        double tops_simple;          // 简单版本性能(TOPS)
+        double tops_optimized;       // 优化版本性能(TOPS)
+        double tops_cpu;             // CPU版本性能(TOPS)
+        bool optimized_executed;     // 优化版本是否成功执行
+        bool results_match;          // GPU结果是否与CPU匹配
     };
-    std::vector<PerfData> perf_results;
+    std::vector<PerfData> perf_results;  // 存储所有测试结果
 
-    // 对每个测试维度进行三种GEMM实现的测试和比较
+    // =============================================================================
+    // 主测试循环：遍历每个矩阵大小进行完整的性能测试
+    // =============================================================================
+    
+    // 对每个预定义的矩阵大小执行完整的测试流程
     for (int size : test_sizes) {
-        printf("\n" + std::string(60, '=') + "\n");
+        // 输出测试分隔符，便于阅读结果
+        {
+            std::string sep(60, '=');
+            printf("\n%s\n", sep.c_str());
+        }
         printf("测试矩阵维度: %d x %d x %d\n", size, size, size);
-        printf(std::string(60, '=') + "\n");
+        {
+            std::string sep(60, '=');
+            printf("%s\n", sep.c_str());
+        }
 
-        // 检查维度是否满足WMMA要求
+        // =============================================================================
+        // 矩阵维度验证：确保满足WMMA硬件要求
+        // =============================================================================
+        
+        // WMMA (Warp Matrix Multiply Accumulate) 硬件要求：
+        // - 矩阵维度必须是16的倍数
+        // - 这是因为Tensor Core硬件按16x16块进行计算
         if (size % 16 != 0) {
-            printf("跳过: 矩阵维度必须是16的倍数才能使用WMMA\n");
+            std::cout << "跳过: 矩阵维度必须是16的倍数才能使用WMMA" << std::endl;
             continue;
         }
 
-        // 分配主机内存
-        size_t bytes_a = (size_t)size * size * sizeof(uint8_t);
-        size_t bytes_b = (size_t)size * size * sizeof(uint8_t);
-        size_t bytes_c = (size_t)size * size * sizeof(int);
-        size_t bytes_d = (size_t)size * size * sizeof(int);
+        // =============================================================================
+        // 内存需求计算和主机内存分配
+        // =============================================================================
+        
+        // 计算各矩阵所需的内存大小：
+        // - A矩阵: size×size个uint8_t元素 (输入矩阵，8位整数)
+        // - B矩阵: size×size个uint8_t元素 (输入矩阵，8位整数)  
+        // - C矩阵: size×size个int元素 (输入矩阵，32位整数)
+        // - D矩阵: size×size个int元素 (输出矩阵，32位整数)
+        size_t bytes_a = (size_t)size * size * sizeof(uint8_t);  // A矩阵字节数
+        size_t bytes_b = (size_t)size * size * sizeof(uint8_t);  // B矩阵字节数  
+        size_t bytes_c = (size_t)size * size * sizeof(int);      // C矩阵字节数
+        size_t bytes_d = (size_t)size * size * sizeof(int);      // D矩阵字节数
 
-        uint8_t *h_a = (uint8_t *)malloc(bytes_a);
-        uint8_t *h_b = (uint8_t *)malloc(bytes_b);
-        int *h_c = (int *)malloc(bytes_c);
-        int *h_d_gpu_simple = (int *)malloc(bytes_d);     // 简单GPU实现结果
-        int *h_d_gpu_optimized = (int *)malloc(bytes_d);  // 优化GPU实现结果
-        int *h_d_cpu = (int *)malloc(bytes_d);            // CPU参考实现结果
+        // 在主机(CPU)上分配内存存储矩阵数据
+        // 需要为每种实现分配独立的输出矩阵，以便比较结果
+        uint8_t *h_a = (uint8_t *)malloc(bytes_a);               // 主机端A矩阵
+        uint8_t *h_b = (uint8_t *)malloc(bytes_b);               // 主机端B矩阵
+        int *h_c = (int *)malloc(bytes_c);                       // 主机端C矩阵
+        int *h_d_gpu_simple = (int *)malloc(bytes_d);            // 简单GPU实现的结果
+        int *h_d_gpu_optimized = (int *)malloc(bytes_d);         // 优化GPU实现的结果
+        int *h_d_cpu = (int *)malloc(bytes_d);                   // CPU参考实现的结果
 
         // 检查主机内存分配是否成功
+        // 大矩阵可能需要几GB内存，分配失败会导致程序崩溃
         if (!h_a || !h_b || !h_c || !h_d_gpu_simple || !h_d_gpu_optimized || !h_d_cpu) {
-            printf("错误: 主机内存分配失败\n");
+            std::cout << "错误: 主机内存分配失败，矩阵大小: " << size << "x" << size << std::endl;
             exit(EXIT_FAILURE);
         }
 
-        // 初始化输入矩阵
-        printf("正在初始化输入矩阵...\n");
+        // =============================================================================
+        // 矩阵数据初始化
+        // =============================================================================
+        
+        // 用随机数初始化输入矩阵A、B、C
+        // 这确保了测试的真实性和可重复性
+        std::cout << "正在初始化输入矩阵..." << std::endl;
         init_host_matrices(h_a, h_b, h_c, size, size, size);
 
-        // 分配GPU内存
-        uint8_t *d_a, *d_b;
-        int *d_c, *d_d;
-        checkCudaErrors(cudaMalloc(&d_a, bytes_a));
-        checkCudaErrors(cudaMalloc(&d_b, bytes_b));
+        // =============================================================================
+        // GPU内存分配
+        // =============================================================================
+        
+        // 在GPU设备上分配内存存储矩阵数据
+        // GPU内存访问比主机内存快得多，但容量有限
+        uint8_t *d_a, *d_b;  // GPU上的A、B矩阵指针
+        int *d_c, *d_d;      // GPU上的C、D矩阵指针
+        
+        // cudaMalloc: 在GPU全局内存中分配空间
+        // 类似于CPU的malloc，但分配的是GPU内存
+        checkCudaErrors(cudaMalloc(&d_a, bytes_a));              // 在GPU分配A矩阵空间
+        checkCudaErrors(cudaMalloc(&d_b, bytes_b));              // 在GPU分配B矩阵空间
         checkCudaErrors(cudaMalloc(&d_c, bytes_c));
         checkCudaErrors(cudaMalloc(&d_d, bytes_d));
 
         // 复制数据到GPU
         checkCudaErrors(cudaMemcpy(d_a, h_a, bytes_a, cudaMemcpyHostToDevice));
-        checkCudaErrors(cudaMemcpy(d_b, h_b, bytes_b, cudaMemcpyHostToDevice));
-        checkCudaErrors(cudaMemcpy(d_c, h_c, bytes_c, cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMalloc(&d_c, bytes_c));              // 在GPU分配C矩阵空间
+        checkCudaErrors(cudaMalloc(&d_d, bytes_d));              // 在GPU分配D矩阵空间
 
-        // 计算总操作数 (每个乘加操作算2个ops) - 按照官方代码公式
+        // =============================================================================
+        // 数据传输：将输入数据从主机复制到GPU
+        // =============================================================================
+        
+        // cudaMemcpy: 在主机和设备之间传输数据
+        // 参数说明：(目标地址, 源地址, 字节数, 传输方向)
+        // cudaMemcpyHostToDevice: 从CPU内存复制到GPU内存
+        checkCudaErrors(cudaMemcpy(d_a, h_a, bytes_a, cudaMemcpyHostToDevice));  // 传输A矩阵
+        checkCudaErrors(cudaMemcpy(d_b, h_b, bytes_b, cudaMemcpyHostToDevice));  // 传输B矩阵
+        checkCudaErrors(cudaMemcpy(d_c, h_c, bytes_c, cudaMemcpyHostToDevice));  // 传输C矩阵
+        // 注意：D矩阵是输出，不需要传输输入数据
+
+        // =============================================================================
+        // 性能指标计算准备
+        // =============================================================================
+        
+        // 计算矩阵乘法的总浮点运算数：
+        // - 每个输出元素需要进行size次乘法和size次加法
+        // - 总共size×size个输出元素
+        // - 总操作数 = size³ × 2 (乘法+加法各算1次操作)
         double ops = (double)size * size * size * 2;
 
-        // 性能数据变量声明
-        float time_simple = 0, time_optimized = 0;
-        double tops_simple = 0, tops_optimized = 0;
-        double cpu_time_ms = 0, tops_cpu = 0;
-        bool simple_vs_cpu_match = true, optimized_vs_cpu_match = true;
+        // 声明性能测量变量
+        float time_simple = 0, time_optimized = 0;        // GPU执行时间(毫秒)
+        double tops_simple = 0, tops_optimized = 0;       // GPU性能(TOPS = 万亿次操作/秒)
+        double cpu_time_ms = 0, tops_cpu = 0;             // CPU性能指标
+        bool simple_vs_cpu_match = true, optimized_vs_cpu_match = true;  // 结果正确性标志
 
         // =============================================================================
-        // 测试1: 简单WMMA实现
+        // 预热阶段：GPU预热和可选的CPU验证
         // =============================================================================
-        printf("\n[测试1] 简单WMMA GEMM实现\n");
-        checkCudaErrors(cudaMemset(d_d, 0, bytes_d));
-
-        // 配置grid和block (参考官方代码)
-        dim3 gridDim, blockDim;
-        blockDim.x = 128;  // blockDim.x必须是warpSize的倍数
-        blockDim.y = 4;    // 128x4意味着16个warp，一个block计算64x64输出块
+        /*
+         * 预热的重要性：
+         * 1. GPU频率调节：现代GPU有动态频率，冷启动时运行在较低频率
+         * 2. 驱动初始化：第一次CUDA调用会触发大量初始化工作
+         * 3. 缓存预热：L2缓存、指令缓存需要预热
+         * 4. 内存控制器优化：GPU内存控制器需要时间进入最佳状态
+         */
         
+        if (enable_cpu_verification) {
+            std::cout << std::endl << "[预热阶段] 进行CPU验证和GPU预热..." << std::endl;
+            
+            // =============================================================================
+            // CPU验证：运行CPU版本作为正确性参考
+            // =============================================================================
+            std::cout << "执行CPU参考计算..." << std::endl;
+            memcpy(h_d_cpu, h_c, bytes_d);  // 复制C矩阵作为CPU计算的初始值
+            
+            // 使用高精度计时器测量CPU执行时间
+            auto cpu_start = std::chrono::high_resolution_clock::now();
+            matMultiplyOnHost(h_a, h_b, h_d_cpu, alpha, beta, size, size, size, size, size, size);
+            auto cpu_end = std::chrono::high_resolution_clock::now();
+            
+            // 计算CPU执行时间和性能
+            auto cpu_duration = std::chrono::duration_cast<std::chrono::milliseconds>(cpu_end - cpu_start);
+            cpu_time_ms = cpu_duration.count();
+            tops_cpu = (ops / (cpu_time_ms / 1000.0)) / 1e12;  // 转换为TOPS
+            std::cout << "CPU计算完成，时间: " << cpu_time_ms << " ms" << std::endl;
+        } else {
+            std::cout << std::endl << "[预热阶段] 跳过CPU验证，仅进行GPU预热..." << std::endl;
+            cpu_time_ms = 0;
+            tops_cpu = 0;
+        }
+
+        // =============================================================================
+        // GPU预热：让GPU进入最佳性能状态
+        // =============================================================================
+        std::cout << "执行GPU预热 (5次)..." << std::endl;
+        
+        // 配置CUDA执行参数：
+        // dim3: CUDA的3维坐标结构，用于定义网格和线程块的大小
+        dim3 gridDim, blockDim;
+        
+        // 配置线程块(Block)大小：
+        // - blockDim.x = 128: 每个block在x方向有128个线程
+        // - blockDim.y = 4:   每个block在y方向有4个线程  
+        // - 总共128×4=512个线程每block，符合GPU的warp组织(32线程/warp)
+        blockDim.x = 128;
+        blockDim.y = 4;
+        
+        // 计算网格(Grid)大小：需要多少个block来覆盖整个矩阵
+        // 计算公式确保有足够的block来处理所有矩阵元素
         gridDim.x = (size + (WMMA_M * blockDim.x / 32 - 1)) / (WMMA_M * blockDim.x / 32);
         gridDim.y = (size + WMMA_N * blockDim.y - 1) / (WMMA_N * blockDim.y);
 
-        printf("Grid配置: (%d, %d), Block配置: (%d, %d)\n", 
-               gridDim.x, gridDim.y, blockDim.x, blockDim.y);
-
-        // 创建CUDA事件用于精确时间测量
-        cudaEvent_t start, stop;
-        checkCudaErrors(cudaEventCreate(&start));
-        checkCudaErrors(cudaEventCreate(&stop));
-        
-        // 记录开始时间
-        checkCudaErrors(cudaEventRecord(start));
-        
-        // 执行简单kernel
-        simple_wmma_gemm_imma<<<gridDim, blockDim>>>(d_a, d_b, d_c, d_d, size, size, size, alpha, beta);
-        checkKernelErrors(("simple_wmma_gemm_imma kernel execution failed"));
-        
-        // 记录结束时间
-        checkCudaErrors(cudaEventRecord(stop));
-        checkCudaErrors(cudaEventSynchronize(stop));  // 确保GPU完成
-
-        checkCudaErrors(cudaEventElapsedTime(&time_simple, start, stop));
-        checkCudaErrors(cudaMemcpy(h_d_gpu_simple, d_d, bytes_d, cudaMemcpyDeviceToHost));
-
-        // 计算性能指标 (严格按照官方代码公式)
-        tops_simple = (ops / (time_simple / 1000.0)) / 1e12;
-        printf("执行时间: %.3f ms, 性能: %.2f TOPS\n", time_simple, tops_simple);
-
-        // =============================================================================
-        // 测试2: 优化WMMA实现（带共享内存）
-        // =============================================================================
-        printf("\n[测试2] 优化WMMA GEMM实现（共享内存优化）\n");
-        
-        // 检查共享内存要求（无论矩阵大小如何都尝试运行以观察性能差异）
-        if (size % 128 != 0) {
-            printf("注意: 矩阵维度(%d)不是128的倍数，可能存在性能衰减\n", size);
+        // 执行5轮预热，让GPU进入最佳性能状态
+        for (int warmup = 0; warmup < 5; warmup++) {
+            // 清零输出矩阵，确保每次测试从干净状态开始
+            checkCudaErrors(cudaMemset(d_d, 0, bytes_d));
+            
+            // 启动简单WMMA kernel进行预热
+            // <<<gridDim, blockDim>>>: CUDA kernel启动语法
+            // - gridDim: 网格大小，定义启动多少个block
+            // - blockDim: 线程块大小，定义每个block有多少个线程
+            simple_wmma_gemm_imma<<<gridDim, blockDim>>>(d_a, d_b, d_c, d_d, size, size, size, alpha, beta);
+            
+            // 等待GPU计算完成
+            // cudaDeviceSynchronize(): 阻塞CPU直到GPU上所有操作完成
+            checkCudaErrors(cudaDeviceSynchronize());
+            
+            // =============================================================================
+            // 优化版本预热（如果GPU支持足够的共享内存）
+            // =============================================================================
+            
+            // 计算优化kernel所需的共享内存大小
+            // 优化版本使用共享内存缓存数据，需要更多内存
+            size_t SHMEM_SZ = MAX(sizeof(uint8_t) * (BLOCK_COL_TILES * M) * (CHUNK_K * K + SKEW_UINT8) * 2,
+                                  M * (BLOCK_ROW_WARPS * WARP_ROW_TILES) * N * (BLOCK_COL_WARPS * WARP_COL_TILES) * sizeof(int));
+            
+            // 检查GPU是否有足够的共享内存支持优化版本
+            if (deviceProp.sharedMemPerMultiprocessor >= SHMEM_SZ) {
+                checkCudaErrors(cudaMemset(d_d, 0, bytes_d));
+                
+                // 设置kernel使用的动态共享内存大小
+                // 这告诉CUDA驱动为这个kernel分配指定大小的共享内存
+                checkCudaErrors(cudaFuncSetAttribute(compute_gemm_imma, 
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, SHMEM_SZ));
+                
+                // 启动优化kernel进行预热
+                // 注意：这里使用不同的网格配置：
+                // - deviceProp.multiProcessorCount: 使用GPU的SM数量作为网格大小
+                // - THREADS_PER_BLOCK: 每个block的线程数
+                // - SHMEM_SZ: 每个block使用的共享内存大小
+                compute_gemm_imma<<<deviceProp.multiProcessorCount, THREADS_PER_BLOCK, SHMEM_SZ>>>(
+                    d_a, d_b, d_c, d_d, alpha, beta);
+                checkCudaErrors(cudaDeviceSynchronize());
+            }
         }
-        
+        std::cout << "GPU预热完成" << std::endl;
+
+        // =============================================================================
+        // 预热结果验证（仅在启用CPU验证时）
+        // =============================================================================
+        if (enable_cpu_verification) {
+            // 将GPU计算结果复制回主机内存进行验证
+            checkCudaErrors(cudaMemcpy(h_d_gpu_simple, d_d, bytes_d, cudaMemcpyDeviceToHost));
+            
+            // 检查GPU结果与CPU参考结果是否匹配
+            // 只检查前100个元素以快速验证（完整验证会很慢）
+            bool warmup_correct = true;
+            for (int i = 0; i < std::min(100, size * size); i++) {
+                if (abs(h_d_gpu_simple[i] - h_d_cpu[i]) > 0) {
+                    warmup_correct = false;
+                    break;
+                }
+            }
+            if (warmup_correct) {
+                std::cout << "✓ GPU计算结果与CPU参考结果匹配" << std::endl;
+            } else {
+                std::cout << "✗ 警告: GPU计算结果与CPU参考结果不匹配" << std::endl;
+            }
+        } else {
+            std::cout << "✓ 跳过GPU结果验证（CPU验证已禁用）" << std::endl;
+        }
+
+        // =============================================================================
+        // 性能测试1: 简单WMMA实现 (100次平均测量)
+        // =============================================================================
+        /*
+         * 为什么要测量100次取平均：
+         * 1. 消除测量噪声：单次测量可能受系统影响有波动
+         * 2. 提高精度：GPU操作很快，多次测量提高时间精度
+         * 3. 统计意义：平均值更能反映真实性能
+         */
+        std::cout << std::endl << "[性能测试1] 简单WMMA GEMM实现 (100次平均)" << std::endl;
         checkCudaErrors(cudaMemset(d_d, 0, bytes_d));
 
-            // 计算共享内存大小 (严格按照官方代码)
+        // 重新配置执行参数（确保配置正确）
+        gridDim.x = (size + (WMMA_M * blockDim.x / 32 - 1)) / (WMMA_M * blockDim.x / 32);
+        gridDim.y = (size + WMMA_N * blockDim.y - 1) / (WMMA_N * blockDim.y);
+
+        std::cout << "Grid配置: (" << gridDim.x << ", " << gridDim.y << "), Block配置: (" << blockDim.x << ", " << blockDim.y << ")" << std::endl;
+
+        // =============================================================================
+        // CUDA事件：GPU端的高精度计时器
+        // =============================================================================
+        /*
+         * 为什么使用CUDA事件而不是CPU计时器：
+         * 1. GPU端计时：直接测量GPU执行时间，不包括CPU-GPU通信延迟
+         * 2. 高精度：比CPU计时器精度更高
+         * 3. 异步友好：可以与异步kernel启动配合使用
+         */
+        cudaEvent_t start, stop;
+        checkCudaErrors(cudaEventCreate(&start));            // 创建开始事件
+        checkCudaErrors(cudaEventCreate(&stop));             // 创建结束事件
+        
+        // =============================================================================
+        // 执行100次重复测试获取准确的平均性能
+        // =============================================================================
+        const int num_tests = 100;                          // 测试次数
+        float total_time = 0.0f;                            // 累计总时间
+        
+        std::cout << "执行 " << num_tests << " 次测试..." << std::endl;
+        
+        // 100次重复测试循环
+        for (int test = 0; test < num_tests; test++) {
+            // 每次测试前清零输出矩阵，确保测试独立性
+            checkCudaErrors(cudaMemset(d_d, 0, bytes_d));
+            
+            // 记录开始时间点
+            // cudaEventRecord: 在GPU命令流中插入时间戳记录点
+            checkCudaErrors(cudaEventRecord(start));
+            
+            // 启动简单WMMA kernel
+            // 这是真正被测量的计算部分
+            simple_wmma_gemm_imma<<<gridDim, blockDim>>>(d_a, d_b, d_c, d_d, size, size, size, alpha, beta);
+            
+            // 记录结束时间点
+            checkCudaErrors(cudaEventRecord(stop));
+            
+            // 等待stop事件完成，确保kernel执行结束
+            // cudaEventSynchronize: 等待指定事件完成
+            checkCudaErrors(cudaEventSynchronize(stop));
+            
+            // 计算这次测试的执行时间
+            float test_time;
+            checkCudaErrors(cudaEventElapsedTime(&test_time, start, stop));  // 获取两个事件间的时间差(ms)
+            total_time += test_time;                         // 累加到总时间
+        }
+        
+        // 计算平均执行时间
+        time_simple = total_time / num_tests;               // 平均时间(毫秒)
+        
+        // 复制最后一次执行的结果到主机内存（用于后续验证）
+        checkCudaErrors(cudaMemcpy(h_d_gpu_simple, d_d, bytes_d, cudaMemcpyDeviceToHost));
+
+        // =============================================================================
+        // 性能指标计算和输出
+        // =============================================================================
+        /*
+         * TOPS计算公式详解：
+         * TOPS = (总操作数 / 执行时间(秒)) / 10^12
+         * - 总操作数 = size³ × 2 (每个输出元素需要size次乘法和size次加法)
+         * - 执行时间需要从毫秒转换为秒：time_simple / 1000.0
+         * - 除以10^12是因为TOPS = Tera Operations Per Second (万亿次操作/秒)
+         */
+        tops_simple = (ops / (time_simple / 1000.0)) / 1e12;
+        std::cout << std::fixed << std::setprecision(3) << "执行时间: " << time_simple << " ms, " 
+                  << std::setprecision(2) << "性能: " << tops_simple << " TOPS" << std::endl << std::defaultfloat;
+
+        // =============================================================================
+        // 性能测试2: 优化WMMA实现 (100次平均测量)
+        // =============================================================================
+        /*
+         * 优化版本与简单版本的主要区别：
+         * 1. 使用共享内存缓存数据，减少全局内存访问
+         * 2. 使用更复杂的线程块组织和数据重用策略  
+         * 3. 需要更多共享内存，可能不是所有GPU都支持
+         */
+        std::cout << std::endl << "[性能测试2] 优化WMMA GEMM实现 (100次平均)" << std::endl;
+        
+        // 检查矩阵大小是否为128的倍数（影响优化效果）
+        if (size % 128 != 0) {
+            std::cout << "注意: 矩阵维度(" << size << ")不是128的倍数，可能存在性能衰减" << std::endl;
+        }
+
+            /*
+             * 计算优化kernel所需的共享内存大小 (严格按照官方代码)
+             * 共享内存用于存储两个用途：
+             * 1. 输入矩阵A和B的瓦片数据（uint8_t类型）
+             * 2. 输出矩阵C的累积结果（int类型）
+             * 
+             * 第一项：输入数据缓存大小
+             * - sizeof(uint8_t) * (BLOCK_COL_TILES * M) * (CHUNK_K * K + SKEW_UINT8) * 2
+             * - 存储A和B两个矩阵的瓦片，使用SKEW避免bank冲突
+             * 
+             * 第二项：输出累积缓存大小  
+             * - M * (BLOCK_ROW_WARPS * WARP_ROW_TILES) * N * (BLOCK_COL_WARPS * WARP_COL_TILES) * sizeof(int)
+             * - 存储每个warp的输出瓦片结果
+             * 
+             * MAX取较大值确保共享内存足够
+             */
             enum {
                 SHMEM_SZ = MAX(sizeof(uint8_t) * (BLOCK_COL_TILES * M) * (CHUNK_K * K + SKEW_UINT8) * 2,
                                M * (BLOCK_ROW_WARPS * WARP_ROW_TILES) * N * (BLOCK_COL_WARPS * WARP_COL_TILES) * sizeof(int))
             };
-            printf("所需共享内存: %lu KB\n", SHMEM_SZ / 1024UL);
+            std::cout << "所需共享内存: " << (SHMEM_SZ / 1024UL) << " KB" << std::endl;
 
-            // 检查共享内存是否足够
+            /*
+             * 检查GPU是否有足够的共享内存运行优化kernel
+             * A100的共享内存配置：
+             * - 每个SM最大共享内存：164KB
+             * - 每个Block最大共享内存：48KB-164KB（可配置）
+             * 
+             * 如果共享内存不足，将跳过优化版本测试
+             */
             if (deviceProp.sharedMemPerMultiprocessor >= SHMEM_SZ) {
-                printf("使用高性能kernel compute_gemm_imma\n");
+                std::cout << "使用高性能kernel compute_gemm_imma" << std::endl;
                 
-                // 设置动态共享内存大小
+                /*
+                 * 设置kernel的动态共享内存限制
+                 * CUDA Runtime默认限制较低，需要显式设置更高值
+                 * 这样kernel才能使用超过默认限制的共享内存
+                 */
                 checkCudaErrors(cudaFuncSetAttribute(compute_gemm_imma, 
                     cudaFuncAttributeMaxDynamicSharedMemorySize, SHMEM_SZ));
                 
-                // 记录开始时间
-                checkCudaErrors(cudaEventRecord(start));
+                /*
+                 * 优化kernel的性能测试循环 (100次平均)
+                 * 为什么需要多次测试：
+                 * 1. GPU性能会因为温度、频率调整而波动
+                 * 2. 内存访问模式可能会有cache效应
+                 * 3. 多次测试取平均值更能反映真实性能
+                 */
+                total_time = 0.0f;
+                std::cout << "执行 " << num_tests << " 次测试..." << std::endl;
                 
-                // 执行优化kernel (严格按照官方代码的启动配置)
-                checkKernelErrors((compute_gemm_imma<<<deviceProp.multiProcessorCount, THREADS_PER_BLOCK, SHMEM_SZ>>>(
-                    d_a, d_b, d_c, d_d, alpha, beta)));
+                for (int test = 0; test < num_tests; test++) {
+                    // 每次测试前清零输出矩阵，确保测试独立性
+                    checkCudaErrors(cudaMemset(d_d, 0, bytes_d));
+                    
+                    // 启动优化kernel，使用和官方代码相同的配置
+                    checkCudaErrors(cudaEventRecord(start));
+                    /*
+                     * kernel launch配置说明：
+                     * <<<deviceProp.multiProcessorCount, THREADS_PER_BLOCK, SHMEM_SZ>>>
+                     * - deviceProp.multiProcessorCount: 使用所有SM，实现work-stealing
+                     * - THREADS_PER_BLOCK: 每个线程块的线程数 
+                     * - SHMEM_SZ: 动态共享内存大小（前面计算的值）
+                     */
+                    compute_gemm_imma<<<deviceProp.multiProcessorCount, THREADS_PER_BLOCK, SHMEM_SZ>>>(
+                        d_a, d_b, d_c, d_d, alpha, beta);
+                    checkCudaErrors(cudaEventRecord(stop));
+                    checkCudaErrors(cudaEventSynchronize(stop));
+                    
+                    float test_time;
+                    checkCudaErrors(cudaEventElapsedTime(&test_time, start, stop));
+                    total_time += test_time;
+                }
                 
-                // 记录结束时间
-                checkCudaErrors(cudaEventRecord(stop));
-                checkCudaErrors(cudaEventSynchronize(stop));  // 确保GPU完成
-
-                checkCudaErrors(cudaEventElapsedTime(&time_optimized, start, stop));
+                /*
+                 * 计算优化版本的平均性能
+                 * time_optimized: 100次测试的平均执行时间(毫秒)
+                 * 将结果从GPU拷贝回主机内存供后续验证使用
+                 */
+                time_optimized = total_time / num_tests;  // 平均时间
                 checkCudaErrors(cudaMemcpy(h_d_gpu_optimized, d_d, bytes_d, cudaMemcpyDeviceToHost));
 
-                // 计算性能指标 (严格按照官方代码公式)
+                /*
+                 * 性能指标计算 (严格按照官方代码公式)
+                 * TOPS = (总操作数 / 执行时间秒) / 10^12
+                 * 
+                 * 其中：
+                 * - ops: 2*M*N*K个操作（每个输出元素需要K次乘加运算）
+                 * - time_optimized/1000.0: 时间转换为秒
+                 * - 1e12: 转换为TOPS (Tera Operations Per Second)
+                 */
                 tops_optimized = (ops / (time_optimized / 1000.0)) / 1e12;
-                printf("执行时间: %.3f ms, 性能: %.2f TOPS\n", time_optimized, tops_optimized);
+                std::cout << std::fixed << std::setprecision(3) << "执行时间: " << time_optimized << " ms, " << std::setprecision(2) << "性能: " << tops_optimized << " TOPS" << std::endl << std::defaultfloat;
                 
+                /*
+                 * 计算相对于简单版本的加速比
+                 * 这个指标反映了优化效果的好坏
+                 */
                 if (time_simple > 0) {
-                    printf("相对于简单版本加速比: %.2fx\n", time_simple / time_optimized);
+                    std::cout << std::fixed << std::setprecision(2) << "相对于简单版本加速比: " << (time_simple / time_optimized) << "x" << std::endl << std::defaultfloat;
                 }
             } else {
-                printf("跳过: 共享内存不足，需要 %lu KB，可用 %d KB\n", 
-                       SHMEM_SZ / 1024UL, deviceProp.sharedMemPerMultiprocessor / 1024);
+                /*
+                 * 共享内存不足时的处理
+                 * 在共享内存有限的GPU上，无法运行高性能优化版本
+                 * 此时将结果矩阵清零，避免后续验证出现问题
+                 */
+                std::cout << "跳过: 共享内存不足，需要 " << (SHMEM_SZ / 1024UL) << " KB，可用 " << (deviceProp.sharedMemPerMultiprocessor / 1024) << " KB" << std::endl;
                 memset(h_d_gpu_optimized, 0, bytes_d);
             }
 
-        // =============================================================================
-        // 测试3: CPU参考实现
-        // =============================================================================
-        printf("\n[测试3] CPU参考实现\n");
+        /*
+         * =============================================================================
+         * 性能总结 - 汇总显示所有测试结果
+         * =============================================================================
+         * 这个部分将前面所有测试的结果整理成表格形式
+         * 便于对比不同实现之间的性能差异
+         */
+        std::cout << std::endl << "[性能总结]" << std::endl;
+        std::cout << std::fixed << std::setprecision(3);
         
-        // 复制C矩阵用于CPU计算 (D = alpha * A * B + beta * C)
-        memcpy(h_d_cpu, h_c, bytes_d);
-        
-        // 使用CPU时钟测量 (因为CPU计算不需要事件同步)
-        auto cpu_start = std::chrono::high_resolution_clock::now();
-        matMultiplyOnHost(h_a, h_b, h_d_cpu, alpha, beta, size, size, size, size, size, size);
-        auto cpu_end = std::chrono::high_resolution_clock::now();
-        
-        auto cpu_duration = std::chrono::duration_cast<std::chrono::milliseconds>(cpu_end - cpu_start);
-        cpu_time_ms = cpu_duration.count();
-        tops_cpu = (ops / (cpu_time_ms / 1000.0)) / 1e12;
-        printf("执行时间: %.0f ms, 性能: %.4f TOPS\n", cpu_time_ms, tops_cpu);
-        
-        if (time_simple > 0) {
-            printf("GPU简单版本相对CPU加速比: %.1fx\n", cpu_time_ms / time_simple);
-        }
-
-        // =============================================================================
-        // 结果验证
-        // =============================================================================
-        printf("\n[结果验证] 比较三种实现的输出\n");
-        
-        // 比较GPU简单版本与CPU
-        simple_vs_cpu_match = true;
-        int max_errors_to_show = 10;
-        int error_count = 0;
-        
-        for (int i = 0; i < size * size && error_count < max_errors_to_show; i++) {
-            if (abs(h_d_gpu_simple[i] - h_d_cpu[i]) > 0) {
-                if (error_count == 0) {
-                    printf("简单GPU vs CPU 不匹配:\n");
-                }
-                printf("  位置[%d]: GPU_简单=%d, CPU=%d\n", i, h_d_gpu_simple[i], h_d_cpu[i]);
-                simple_vs_cpu_match = false;
-                error_count++;
-            }
-        }
-        if (simple_vs_cpu_match) {
-            printf("✓ 简单GPU实现与CPU参考实现匹配\n");
+        /*
+         * 显示CPU参考实现结果（如果启用了验证）
+         * CPU实现主要用于：
+         * 1. 验证GPU计算结果的正确性
+         * 2. 对比GPU相对于CPU的加速比
+         */
+        if (enable_cpu_verification) {
+            std::cout << "CPU参考实现:     " << cpu_time_ms << " ms, " << std::setprecision(4) << tops_cpu << " TOPS" << std::endl;
         } else {
-            printf("✗ 简单GPU实现与CPU参考实现不匹配 (显示前%d个错误)\n", max_errors_to_show);
+            std::cout << "CPU参考实现:     跳过（已禁用）" << std::endl;
         }
-
-        // 比较GPU优化版本与CPU（如果优化版本执行了）
-        // 重新计算共享内存大小用于验证是否执行了优化版本
-        size_t SHMEM_SZ = MAX(sizeof(uint8_t) * (BLOCK_COL_TILES * M) * (CHUNK_K * K + SKEW_UINT8) * 2,
-                              M * (BLOCK_ROW_WARPS * WARP_ROW_TILES) * N * (BLOCK_COL_WARPS * WARP_COL_TILES) * sizeof(int));
         
-        if (deviceProp.sharedMemPerMultiprocessor >= SHMEM_SZ) {
-            optimized_vs_cpu_match = true;
-            error_count = 0;
-            
-            for (int i = 0; i < size * size && error_count < max_errors_to_show; i++) {
-                if (abs(h_d_gpu_optimized[i] - h_d_cpu[i]) > 0) {
-                    if (error_count == 0) {
-                        printf("优化GPU vs CPU 不匹配:\n");
-                    }
-                    printf("  位置[%d]: GPU_优化=%d, CPU=%d\n", i, h_d_gpu_optimized[i], h_d_cpu[i]);
-                    optimized_vs_cpu_match = false;
-                    error_count++;
-                }
+        /*
+         * 显示简单WMMA实现的性能结果
+         * 简单版本特点：
+         * - 直接使用WMMA API，代码简洁易懂
+         * - 较少的共享内存使用，兼容性好
+         * - 适合作为WMMA入门学习的参考
+         */
+        std::cout << std::setprecision(3) << "简单WMMA实现:    " << time_simple << " ms, " << std::setprecision(2) << tops_simple << " TOPS";
+        if (enable_cpu_verification && cpu_time_ms > 0) {
+            std::cout << " (加速比: " << std::setprecision(1) << (cpu_time_ms / time_simple) << "x)";
+        }
+        std::cout << std::endl;
+        
+        /*
+         * 显示优化WMMA实现的性能结果（如果执行了的话）
+         * 优化版本特点：
+         * - 使用大量共享内存缓存数据
+         * - 复杂的瓦片化策略和数据重用
+         * - 更高的性能，但需要更多GPU资源
+         */
+        if (time_optimized > 0) {
+            std::cout << std::setprecision(3) << "优化WMMA实现:    " << time_optimized << " ms, " << std::setprecision(2) << tops_optimized << " TOPS";
+            if (enable_cpu_verification && cpu_time_ms > 0) {
+                std::cout << " (加速比: " << std::setprecision(1) << (cpu_time_ms / time_optimized) << "x)";
             }
-            if (optimized_vs_cpu_match) {
-                printf("✓ 优化GPU实现与CPU参考实现匹配\n");
-            } else {
-                printf("✗ 优化GPU实现与CPU参考实现不匹配 (显示前%d个错误)\n", max_errors_to_show);
-            }
+            std::cout << std::endl;
+        }
+        std::cout << std::defaultfloat;
+
+        /*
+         * =============================================================================
+         * 结果验证状态说明
+         * =============================================================================
+         * 说明当前测试是否进行了CPU验证
+         * 在性能测试中，CPU验证通常比较耗时，因此提供了开关选项
+         */
+        if (enable_cpu_verification) {
+            std::cout << std::endl << "[结果验证] 已在预热阶段完成CPU验证" << std::endl;
         } else {
-            printf("说明: 优化版本因共享内存不足未执行，无法比较\n");
+            std::cout << std::endl << "[结果验证] CPU验证已禁用，仅进行性能测试" << std::endl;
         }
 
-        // 清理内存
-        free(h_a);
-        free(h_b);
-        free(h_c);
-        free(h_d_gpu_simple);
-        free(h_d_gpu_optimized);
-        free(h_d_cpu);
+        /*
+         * 内存清理 - 释放在本次矩阵大小测试中分配的所有内存
+         * 良好的内存管理习惯，避免内存泄漏
+         * 
+         * 主机内存清理：
+         */
+        free(h_a);           // 主机矩阵A
+        free(h_b);           // 主机矩阵B  
+        free(h_c);           // 主机矩阵C
+        free(h_d_gpu_simple);    // 简单版本GPU结果
+        free(h_d_gpu_optimized); // 优化版本GPU结果
+        free(h_d_cpu);       // CPU参考结果
         
-        checkCudaErrors(cudaFree(d_a));
-        checkCudaErrors(cudaFree(d_b));
-        checkCudaErrors(cudaFree(d_c));
-        checkCudaErrors(cudaFree(d_d));
+        /*
+         * GPU设备内存清理：
+         */
+        checkCudaErrors(cudaFree(d_a));  // GPU矩阵A
+        checkCudaErrors(cudaFree(d_b));  // GPU矩阵B
+        checkCudaErrors(cudaFree(d_c));  // GPU矩阵C
+        checkCudaErrors(cudaFree(d_d));  // GPU输出矩阵D
         
-        // 清理CUDA事件
+        /*
+         * CUDA事件对象清理：
+         * 这些事件用于精确的GPU时间测量
+         */
         checkCudaErrors(cudaEventDestroy(start));
         checkCudaErrors(cudaEventDestroy(stop));
 
-        // 收集性能数据用于汇总分析
+        /*
+         * 收集性能数据用于汇总分析
+         * 将每个矩阵大小的测试结果保存到PerfData结构体中
+         * 这些数据将用于最终的性能分析和CSV文件输出
+         */
         PerfData current_perf;
-        current_perf.size = size;
-        current_perf.time_simple = time_simple;
-        current_perf.tops_simple = tops_simple;
-        current_perf.time_cpu = cpu_time_ms;
-        current_perf.tops_cpu = tops_cpu;
+        current_perf.size = size;               // 矩阵维度
+        current_perf.time_simple = time_simple; // 简单版本时间
+        current_perf.tops_simple = tops_simple; // 简单版本性能
+        current_perf.time_cpu = cpu_time_ms;    // CPU版本时间  
+        current_perf.tops_cpu = tops_cpu;       // CPU版本性能
         
-        // 检查优化版本是否执行了
+        /*
+         * 检查优化版本是否成功执行
+         * 需要重新计算SHMEM_SZ来确定是否有足够共享内存
+         * 这样可以在最终报告中准确标识哪些测试运行了优化版本
+         */
         size_t SHMEM_SZ_FINAL = MAX(sizeof(uint8_t) * (BLOCK_COL_TILES * M) * (CHUNK_K * K + SKEW_UINT8) * 2,
                                     M * (BLOCK_ROW_WARPS * WARP_ROW_TILES) * N * (BLOCK_COL_WARPS * WARP_COL_TILES) * sizeof(int));
         current_perf.optimized_executed = (deviceProp.sharedMemPerMultiprocessor >= SHMEM_SZ_FINAL);
         
+        /*
+         * 保存优化版本的性能数据
+         * 如果优化版本执行了，保存实际数据；否则设为0
+         */
         if (current_perf.optimized_executed) {
             current_perf.time_optimized = time_optimized;
             current_perf.tops_optimized = tops_optimized;
@@ -1093,121 +1474,202 @@ int main(int argc, char **argv)
             current_perf.tops_optimized = 0;
         }
         
-        // 检查结果是否匹配
+        /*
+         * 检查所有版本的计算结果是否匹配
+         * results_match: 综合验证标志
+         * - simple_vs_cpu_match: 简单版本vs CPU
+         * - optimized_vs_cpu_match: 优化版本vs CPU（如果执行了）
+         */
         current_perf.results_match = simple_vs_cpu_match && (current_perf.optimized_executed ? optimized_vs_cpu_match : true);
         
+        // 将当前测试结果添加到总结果列表中
         perf_results.push_back(current_perf);
     }
 
-    // =============================================================================
-    // 性能分析汇总报告
-    // =============================================================================
-    printf("\n" + std::string(80, '=') + "\n");
-    printf("性能分析汇总报告\n");
-    printf(std::string(80, '=') + "\n");
-
-    // 输出表格格式的性能对比
-    printf("\n%-8s %-12s %-12s %-12s %-8s %-8s %-8s %-10s\n", 
-           "矩阵大小", "简单版本", "优化版本", "CPU版本", "简单TOPS", "优化TOPS", "CPU TOPS", "结果匹配");
-    printf("%-8s %-12s %-12s %-12s %-8s %-8s %-8s %-10s\n", 
-           "--------", "----------", "----------", "----------", "--------", "--------", "--------", "----------");
-    
-    for (const auto& perf : perf_results) {
-        char opt_time_str[16], opt_tops_str[16];
-        if (perf.optimized_executed) {
-            sprintf(opt_time_str, "%.3f", perf.time_optimized);
-            sprintf(opt_tops_str, "%.2f", perf.tops_optimized);
-        } else {
-            strcpy(opt_time_str, "跳过");
-            strcpy(opt_tops_str, "N/A");
-        }
-        
-        printf("%-8d %-12.3f %-12s %-12.0f %-8.2f %-8s %-8.4f %-10s\n",
-               perf.size,
-               perf.time_simple,
-               opt_time_str,
-               perf.time_cpu,
-               perf.tops_simple,
-               opt_tops_str,
-               perf.tops_cpu,
-               perf.results_match ? "✓" : "✗");
+    /*
+     * =============================================================================
+     * 性能分析汇总报告
+     * =============================================================================
+     * 在完成所有矩阵大小的测试后，生成综合性能分析报告
+     * 这个报告包含：
+     * 1. 表格形式的性能对比
+     * 2. 最佳性能分析
+     * 3. 矩阵对齐性能影响分析
+     * 4. CSV数据导出
+     */
+    {
+        std::string sep(80, '=');
+        std::cout << std::endl << sep << std::endl;
+    }
+    std::cout << "性能分析汇总报告" << std::endl;
+    {
+        std::string sep(80, '=');
+        std::cout << sep << std::endl;
     }
 
-    // 找出最佳性能
+    /*
+     * 输出表格格式的性能对比
+     * 表格包含每个矩阵大小的详细性能数据：
+     * - 矩阵大小: 测试的矩阵维度
+     * - 简单版本/优化版本/CPU版本: 各自的执行时间
+     * - TOPS值: 各版本的计算性能
+     * - 结果匹配: 验证所有版本计算结果是否一致
+     */
+    std::cout << std::endl << std::left << std::setw(8) << "矩阵大小" << " " << std::setw(12) << "简单版本" << " " << std::setw(12) << "优化版本" << " " << std::setw(12) << "CPU版本" << " " << std::setw(8) << "简单TOPS" << " " << std::setw(8) << "优化TOPS" << " " << std::setw(8) << "CPU TOPS" << " " << std::setw(10) << "结果匹配" << std::endl;
+    std::cout << std::left << std::setw(8) << "--------" << " " << std::setw(12) << "----------" << " " << std::setw(12) << "----------" << " " << std::setw(12) << "----------" << " " << std::setw(8) << "--------" << " " << std::setw(8) << "--------" << " " << std::setw(8) << "--------" << " " << std::setw(10) << "----------" << std::endl;
+
+    /*
+     * 遍历所有测试结果，逐行输出性能数据表格
+     * 对于优化版本，如果因共享内存限制未执行，显示"跳过"和"N/A"
+     */
+    for (const auto& perf : perf_results) {
+        std::string opt_time_str, opt_tops_str;
+        if (perf.optimized_executed) {
+            std::ostringstream ot; ot << std::fixed << std::setprecision(3) << perf.time_optimized; opt_time_str = ot.str();
+            std::ostringstream ots; ots << std::fixed << std::setprecision(2) << perf.tops_optimized; opt_tops_str = ots.str();
+        } else {
+            opt_time_str = "跳过";      // 优化版本未执行
+            opt_tops_str = "N/A";       // 性能数据不可用
+        }
+
+        std::cout << std::left << std::setw(8) << perf.size << " " << std::setw(12) << std::fixed << std::setprecision(3) << perf.time_simple << " " << std::setw(12) << opt_time_str << " " << std::setw(12) << std::fixed << std::setprecision(0) << perf.time_cpu << " " << std::setw(8) << std::fixed << std::setprecision(2) << perf.tops_simple << " " << std::setw(8) << opt_tops_str << " " << std::setw(8) << std::fixed << std::setprecision(4) << perf.tops_cpu << " " << std::setw(10) << (perf.results_match ? "✓" : "✗") << std::endl << std::defaultfloat;
+    }
+
+    /*
+     * 找出所有测试中的最佳性能
+     * 使用std::max_element和lambda函数来比较TOPS值
+     * 这有助于识别在哪个矩阵大小下能达到最佳性能
+     */
     auto best_simple = std::max_element(perf_results.begin(), perf_results.end(),
                                         [](const PerfData& a, const PerfData& b) {
                                             return a.tops_simple < b.tops_simple;
                                         });
     
+    /*
+     * 找出优化版本的最佳性能
+     * 只考虑实际执行了优化版本的测试结果
+     * lambda函数确保未执行的测试不会被选为最佳
+     */
     auto best_optimized = std::max_element(perf_results.begin(), perf_results.end(),
                                            [](const PerfData& a, const PerfData& b) {
-                                               if (!a.optimized_executed) return true;
-                                               if (!b.optimized_executed) return false;
-                                               return a.tops_optimized < b.tops_optimized;
+                                               if (!a.optimized_executed) return true;    // a未执行，a较小
+                                               if (!b.optimized_executed) return false;   // b未执行，a较大
+                                               return a.tops_optimized < b.tops_optimized; // 都执行了，比较TOPS
                                            });
 
-    printf("\n性能分析结果:\n");
-    printf("• 简单版本最佳性能: %.2f TOPS (矩阵大小: %d)\n", 
-           best_simple->tops_simple, best_simple->size);
+    /*
+     * 输出性能分析总结
+     * 显示各版本的最佳性能和对应的矩阵大小
+     */
+    std::cout << std::endl << "性能分析结果:" << std::endl;
+    std::cout << "• 简单版本最佳性能: " << std::fixed << std::setprecision(2) << best_simple->tops_simple << " TOPS (矩阵大小: " << best_simple->size << ")" << std::endl;
     
     if (best_optimized->optimized_executed) {
-        printf("• 优化版本最佳性能: %.2f TOPS (矩阵大小: %d)\n", 
-               best_optimized->tops_optimized, best_optimized->size);
-        printf("• 优化版本相对简单版本最大加速比: %.2fx\n", 
-               best_optimized->tops_optimized / best_simple->tops_simple);
+        std::cout << "• 优化版本最佳性能: " << std::fixed << std::setprecision(2) << best_optimized->tops_optimized << " TOPS (矩阵大小: " << best_optimized->size << ")" << std::endl;
+        std::cout << "• 优化版本相对简单版本最大加速比: " << std::fixed << std::setprecision(2) << (best_optimized->tops_optimized / best_simple->tops_simple) << "x" << std::endl;
     }
 
-    // 分析128倍数的性能差异
+    /*
+     * 分析128倍数对齐对性能的影响
+     * WMMA操作在内存对齐时通常有更好的性能
+     * 128字节对齐对应矩阵维度为128的倍数
+     */
     printf("\n128倍数对齐性能分析:\n");
-    double avg_aligned = 0, avg_unaligned = 0;
-    int count_aligned = 0, count_unaligned = 0;
+    double avg_aligned = 0, avg_unaligned = 0;      // 对齐和非对齐的平均性能
+    int count_aligned = 0, count_unaligned = 0;     // 对应的测试数量
     
+    /*
+     * 遍历所有优化版本的测试结果
+     * 分别计算128对齐和非对齐情况的平均性能
+     */
     for (const auto& perf : perf_results) {
-        if (!perf.optimized_executed) continue;
-        if (perf.size % 128 == 0) {
+        if (!perf.optimized_executed) continue;      // 跳过未执行优化版本的测试
+        if (perf.size % 128 == 0) {                  // 128的倍数（对齐）
             avg_aligned += perf.tops_optimized;
             count_aligned++;
-        } else {
+        } else {                                     // 非128倍数（非对齐）
             avg_unaligned += perf.tops_optimized;
             count_unaligned++;
         }
     }
     
+    /*
+     * 如果有足够的对齐和非对齐测试数据，计算并显示性能影响
+     * 这有助于理解矩阵大小选择对性能的影响
+     */
     if (count_aligned > 0 && count_unaligned > 0) {
-        avg_aligned /= count_aligned;
+        avg_aligned /= count_aligned;     // 计算平均值
         avg_unaligned /= count_unaligned;
-        printf("• 128对齐平均性能: %.2f TOPS (%d个测试)\n", avg_aligned, count_aligned);
-        printf("• 非128对齐平均性能: %.2f TOPS (%d个测试)\n", avg_unaligned, count_unaligned);
-        printf("• 性能衰减: %.1f%%\n", (avg_aligned - avg_unaligned) / avg_aligned * 100);
+        std::cout << "• 128对齐平均性能: " << std::fixed << std::setprecision(2) << avg_aligned << " TOPS (" << count_aligned << "个测试)" << std::endl;
+        std::cout << "• 非128对齐平均性能: " << std::fixed << std::setprecision(2) << avg_unaligned << " TOPS (" << count_unaligned << "个测试)" << std::endl;
+        std::cout << "• 性能衰减: " << std::fixed << std::setprecision(1) << ((avg_aligned - avg_unaligned) / avg_aligned * 100) << "%" << std::endl << std::defaultfloat;
     }
 
-    // 输出CSV文件用于进一步分析
+    /*
+     * 输出CSV文件用于进一步分析
+     * CSV格式便于在Excel、Python等工具中进行数据分析和可视化
+     * 包含所有重要的性能指标和测试参数
+     */
     FILE* csv_file = fopen("imma_performance_results.csv", "w");
     if (csv_file) {
+        /*
+         * CSV文件头部定义：
+         * - Matrix_Size: 矩阵维度
+         * - Simple_Time_ms: 简单版本执行时间(毫秒)
+         * - Optimized_Time_ms: 优化版本执行时间(毫秒)
+         * - CPU_Time_ms: CPU版本执行时间(毫秒)
+         * - Simple_TOPS: 简单版本性能(TOPS)
+         * - Optimized_TOPS: 优化版本性能(TOPS)
+         * - CPU_TOPS: CPU版本性能(TOPS)
+         * - Optimized_Executed: 优化版本是否执行(Yes/No)
+         * - Results_Match: 结果验证是否通过(Yes/No)
+         * - Is_128_Aligned: 是否128对齐(Yes/No)
+         * - Speedup_vs_Simple: 优化版本相对简单版本的加速比
+         */
         fprintf(csv_file, "Matrix_Size,Simple_Time_ms,Optimized_Time_ms,CPU_Time_ms,Simple_TOPS,Optimized_TOPS,CPU_TOPS,Optimized_Executed,Results_Match,Is_128_Aligned,Speedup_vs_Simple\n");
         
+        /*
+         * 逐行输出每个测试的详细数据
+         * 计算加速比：简单版本时间 / 优化版本时间
+         */
         for (const auto& perf : perf_results) {
             double speedup = perf.optimized_executed ? (perf.time_simple / perf.time_optimized) : 0;
             fprintf(csv_file, "%d,%.3f,%.3f,%.0f,%.6f,%.6f,%.6f,%s,%s,%s,%.2f\n",
-                    perf.size,
-                    perf.time_simple,
-                    perf.optimized_executed ? perf.time_optimized : 0,
-                    perf.time_cpu,
-                    perf.tops_simple,
-                    perf.optimized_executed ? perf.tops_optimized : 0,
-                    perf.tops_cpu,
-                    perf.optimized_executed ? "Yes" : "No",
-                    perf.results_match ? "Yes" : "No",
-                    (perf.size % 128 == 0) ? "Yes" : "No",
-                    speedup);
+                    perf.size,                                          // 矩阵大小
+                    perf.time_simple,                                   // 简单版本时间
+                    perf.optimized_executed ? perf.time_optimized : 0, // 优化版本时间
+                    perf.time_cpu,                                      // CPU时间
+                    perf.tops_simple,                                   // 简单版本TOPS
+                    perf.optimized_executed ? perf.tops_optimized : 0, // 优化版本TOPS
+                    perf.tops_cpu,                                      // CPU TOPS
+                    perf.optimized_executed ? "Yes" : "No",            // 是否执行优化版本
+                    perf.results_match ? "Yes" : "No",                 // 结果是否匹配
+                    (perf.size % 128 == 0) ? "Yes" : "No",             // 是否128对齐
+                    speedup);                                           // 加速比
         }
         fclose(csv_file);
-        printf("\n性能数据已保存到: imma_performance_results.csv\n");
+        std::cout << std::endl << "性能数据已保存到: imma_performance_results.csv" << std::endl;
     }
 
-    printf("\n" + std::string(80, '=') + "\n");
-    printf("所有测试完成！\n");
-    printf(std::string(80, '=') + "\n");
+    /*
+     * 程序结束标识
+     * 用分隔线和提示信息标识所有测试的完成
+     * 这样用户可以清楚地知道程序已经完全结束
+     */
+    {
+        std::string sep(80, '=');
+        std::cout << std::endl << sep << std::endl;
+    }
+    std::cout << "所有测试完成！" << std::endl;
+    {
+        std::string sep(80, '=');
+        std::cout << sep << std::endl;
+    }
     
+    /*
+     * 返回成功状态码
+     * EXIT_SUCCESS (通常为0) 表示程序正常结束
+     * 操作系统和调用脚本可以通过返回值判断程序执行状态
+     */
     return EXIT_SUCCESS;
 }

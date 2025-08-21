@@ -1,0 +1,1 @@
+/usr/bin/g++ @CMakeFiles/imma.dir/objects1.rsp CMakeFiles/imma.dir/cmake_device_link.o -o imma @CMakeFiles/imma.dir/linkLibs.rsp -L"/usr/local/cuda-12.2/targets/x86_64-linux/lib/stubs" -L"/usr/local/cuda-12.2/targets/x86_64-linux/lib"
