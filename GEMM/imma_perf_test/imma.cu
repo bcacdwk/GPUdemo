@@ -37,6 +37,7 @@
 #include <helper_cuda.h>
 #include <helper_functions.h>
 
+
 // =============================================================================
 // 错误检查宏定义
 // =============================================================================
@@ -82,15 +83,17 @@
 #define WMMA_K 16                       // WMMA API的K维度
 
 // ========== GEMM全局矩阵配置 ==========
+// 注意：以下宏定义已被动态参数替代，仅保留用于参考
+// 在compute_gemm_imma函数中，这些值通过参数传入：m_tiles, n_tiles, k_tiles
 // 定义全局矩阵由多少个16x16的WMMA块组成（官方默认配置）
-#define M_TILES 256                     // M维度的块数量（256个16x16块）
-#define N_TILES 256                     // N维度的块数量（256个16x16块）
-#define K_TILES 256                     // K维度的块数量（256个16x16块）
+// #define M_TILES 256                     // M维度的块数量（256个16x16块）- 已改为动态参数
+// #define N_TILES 256                     // N维度的块数量（256个16x16块）- 已改为动态参数  
+// #define K_TILES 256                     // K维度的块数量（256个16x16块）- 已改为动态参数
 
-// 计算全局矩阵的实际维度
-#define M_GLOBAL (M * M_TILES)          // 全局矩阵A和C的行数 = 16 * 256 = 4096
-#define N_GLOBAL (N * N_TILES)          // 全局矩阵B和C的列数 = 16 * 256 = 4096
-#define K_GLOBAL (K * K_TILES)          // 全局矩阵A和B的内积维度 = 16 * 256 = 4096
+// 计算全局矩阵的实际维度 - 已改为函数内局部变量
+// #define M_GLOBAL (M * M_TILES)          // 全局矩阵A和C的行数 = 16 * 256 = 4096
+// #define N_GLOBAL (N * N_TILES)          // 全局矩阵B和C的列数 = 16 * 256 = 4096
+// #define K_GLOBAL (K * K_TILES)          // 全局矩阵A和B的内积维度 = 16 * 256 = 4096
 
 // ========== 矩阵存储布局配置 ==========
 #define C_LAYOUT wmma::mem_row_major    // C和D矩阵使用行主序存储布局
@@ -134,7 +137,7 @@
 
 // ========== 内存访问步长配置 ==========
 // 定义各种内存访问的步长，用于计算内存地址偏移
-#define GLOBAL_MEM_STRIDE N_GLOBAL      // 全局内存按行访问的步长 = 4096（下一行的起始位置）
+// #define GLOBAL_MEM_STRIDE N_GLOBAL      // 全局内存按行访问的步长 - 已改为函数内局部变量
 #define SHMEM_STRIDE (N * BLOCK_ROW_TILES)  // 共享内存的步长 = 16*8 = 128（共享内存中下一行的位置）
 #define SHMEM_OFFSET (N * WARP_ROW_TILES)   // 每个warp在共享内存中的偏移 = 16*4 = 64
 
@@ -179,16 +182,29 @@ using namespace std;
  * 4. 避免分支发散：使用统一的控制流
  * 
  * 参数说明：
- * A: 输入矩阵A (M_GLOBAL x K_GLOBAL, 行主序, uint8_t类型)
- * B: 输入矩阵B (K_GLOBAL x N_GLOBAL, 列主序, uint8_t类型)  
- * C: 输入矩阵C (M_GLOBAL x N_GLOBAL, 行主序, int类型)
- * D: 输出矩阵D (M_GLOBAL x N_GLOBAL, 行主序, int类型)
+ * A: 输入矩阵A (m_global x k_global, 行主序, uint8_t类型)
+ * B: 输入矩阵B (k_global x n_global, 列主序, uint8_t类型)  
+ * C: 输入矩阵C (m_global x n_global, 行主序, int类型)
+ * D: 输出矩阵D (m_global x n_global, 行主序, int类型)
+ * m_tiles, n_tiles, k_tiles: 矩阵的块数量 (维度必须是16的倍数)
  * alpha, beta: 标量系数
  * 
- * 注意：此函数完全复制自NVIDIA官方CUDA样例，未做任何修改
+ * 注意：此函数已修改为支持动态矩阵维度，不再依赖静态宏定义
  */
-__global__ void compute_gemm_imma(const uint8_t *A, const uint8_t *B, const int *C, int *D, int alpha, int beta)
+__global__ void compute_gemm_imma(const uint8_t *A, const uint8_t *B, const int *C, int *D, 
+                                  int m_tiles, int n_tiles, int k_tiles, int alpha, int beta)
 {
+    // ========== 动态矩阵维度计算 ==========
+    // 根据传入的tiles参数计算实际的矩阵维度
+    // 注意：某些变量在当前kernel实现中可能不直接使用，但保留用于完整性和未来扩展
+    const int m_global = M * m_tiles;       // 全局矩阵A和C的行数（当前实现中通过tiles参数间接使用）
+    const int n_global = N * n_tiles;       // 全局矩阵B和C的列数（用于计算global_mem_stride）
+    const int k_global = K * k_tiles;       // 全局矩阵A和B的内积维度（用于内存地址计算）
+    const int global_mem_stride = n_global; // 全局内存按行访问的步长（用于矩阵元素寻址）
+
+    // 避免编译器警告：明确标记m_global可能在某些编译配置下未直接使用
+    (void)m_global;
+
     // ========== 共享内存声明和布局设计 ==========
     // 动态共享内存声明：二维数组，每行包含 CHUNK_K*K + SKEW_UINT8 个uint8_t元素
     // 设计原理：
@@ -246,18 +262,18 @@ __global__ void compute_gemm_imma(const uint8_t *A, const uint8_t *B, const int 
         // 将一维的block_pos转换为二维的矩阵块坐标(block_tile_i, block_tile_j)
         // 
         // 计算原理：
-        // 1. 总的列块数：N_TILES / BLOCK_COL_TILES
-        // 2. 当前在第几个行块组：(block_pos * BLOCK_ROW_TILES) / N_TILES
+        // 1. 总的列块数：n_tiles / BLOCK_COL_TILES
+        // 2. 当前在第几个行块组：(block_pos * BLOCK_ROW_TILES) / n_tiles
         // 3. 实际的行块索引：需要乘以BLOCK_COL_TILES来跳过中间的行
         // 
         // 注意：这个计算非常容易出错，必须理解矩阵分块的逻辑！
-        const unsigned int block_tile_i = ((block_pos * BLOCK_ROW_TILES) / N_TILES) * (BLOCK_COL_TILES);
-        const unsigned int block_tile_j = (block_pos * BLOCK_COL_TILES) % N_TILES;
+        const unsigned int block_tile_i = ((block_pos * BLOCK_ROW_TILES) / n_tiles) * (BLOCK_COL_TILES);
+        const unsigned int block_tile_j = (block_pos * BLOCK_COL_TILES) % n_tiles;
 
         // ========== 循环终止条件检查 ==========
         // 当行索引超出矩阵范围时，所有工作完成，退出循环
         // 这是整个kernel的自然终止点
-        if (block_tile_i >= M_TILES) {
+        if (block_tile_i >= m_tiles) {
             break;
         }
 
@@ -265,9 +281,9 @@ __global__ void compute_gemm_imma(const uint8_t *A, const uint8_t *B, const int 
         // 计算当前warp需要从全局内存复制C矩阵数据的起始地址
         // 地址计算公式：
         // - (block_tile_i + warpId) * M：当前warp负责的行起始位置
-        // - GLOBAL_MEM_STRIDE：全局内存中行与行之间的步长
+        // - global_mem_stride：全局内存中行与行之间的步长
         // - block_tile_j * N：列起始位置
-        const size_t gmem_idx = (block_tile_i + warpId) * M * GLOBAL_MEM_STRIDE + block_tile_j * N;
+        const size_t gmem_idx = (block_tile_i + warpId) * M * global_mem_stride + block_tile_j * N;
         const int *src_gmem_warp_stream_ptr = &C[gmem_idx];
 
         // ========== 向量化内存传输（关键性能优化） ==========
@@ -283,7 +299,7 @@ __global__ void compute_gemm_imma(const uint8_t *A, const uint8_t *B, const int 
             // 执行向量化内存拷贝：全局内存 -> 共享内存
             // 每个线程负责一个int4（16字节）的传输
             *((copy_t *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId) =
-                *((copy_t *)(src_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) + laneId);
+                *((copy_t *)(src_gmem_warp_stream_ptr + global_mem_stride * i) + laneId);
         }
 
         // ========== 同步点1：确保C矩阵数据传输完成 ==========
@@ -351,13 +367,13 @@ __global__ void compute_gemm_imma(const uint8_t *A, const uint8_t *B, const int 
         // 
         // 地址计算解析：
         // 对于A矩阵（warpId < 4）：
-        // - block_tile_i * M * K_GLOBAL：当前块行的起始地址
-        // - M * K_GLOBAL * (warpId % 4) * 2：当前warp负责的具体区域
+        // - block_tile_i * M * k_global：当前块行的起始地址
+        // - M * k_global * (warpId % 4) * 2：当前warp负责的具体区域
         // 对于B矩阵（warpId >= 4）：
-        // - block_tile_j * N * K_GLOBAL：当前块列的起始地址
-        // - N * K_GLOBAL * (warpId % 4) * 2：当前warp负责的具体区域
-        const uint8_t *warp_ptr = (warpId < 4) ? (&A[block_tile_i * M * K_GLOBAL] + M * K_GLOBAL * (warpId % 4) * 2)
-                                               : (&B[block_tile_j * N * K_GLOBAL] + N * K_GLOBAL * (warpId % 4) * 2);
+        // - block_tile_j * N * k_global：当前块列的起始地址
+        // - N * k_global * (warpId % 4) * 2：当前warp负责的具体区域
+        const uint8_t *warp_ptr = (warpId < 4) ? (&A[block_tile_i * M * k_global] + M * k_global * (warpId % 4) * 2)
+                                               : (&B[block_tile_j * N * k_global] + N * k_global * (warpId % 4) * 2);
 
         // ========== K维度分块处理主循环 ==========
         // 沿全局K维度按CHUNK_K大小的固定步长遍历
@@ -366,7 +382,7 @@ __global__ void compute_gemm_imma(const uint8_t *A, const uint8_t *B, const int 
         // 2. 每次迭代处理CHUNK_K个K维度，减少共享内存需求
         // 3. 在每个K块内进行完整的矩阵乘加运算
         #pragma unroll
-        for (int tile_k = 0; tile_k < K_TILES; tile_k += CHUNK_K) {
+        for (int tile_k = 0; tile_k < k_tiles; tile_k += CHUNK_K) {
             
             // ========== 共享内存索引计算（复杂但关键的部分） ==========
             // 将A和B矩阵的当前K切片复制到共享内存
@@ -389,14 +405,14 @@ __global__ void compute_gemm_imma(const uint8_t *A, const uint8_t *B, const int 
             // 
             // 地址计算分解：
             // 1. warp_ptr + tile_k * K：K维度的基础偏移
-            // 2. (laneId / CHUNK_COPY_LINE_LANES) * K_GLOBAL：lane组内的行偏移
+            // 2. (laneId / CHUNK_COPY_LINE_LANES) * k_global：lane组内的行偏移
             // 3. (laneId % CHUNK_COPY_LINE_LANES)：lane组内的列偏移
             // 
             // 设计原理：
             // - 每个warp内的lane按组工作
             // - 前半部分lane复制第一行/列，后半部分复制下一行/列
             // - 确保内存访问的合并和效率
-            int4 *lane_ptr = (int4 *)(warp_ptr + tile_k * K + (laneId / CHUNK_COPY_LINE_LANES) * K_GLOBAL)
+            int4 *lane_ptr = (int4 *)(warp_ptr + tile_k * K + (laneId / CHUNK_COPY_LINE_LANES) * k_global)
                            + (laneId % CHUNK_COPY_LINE_LANES);
 
             // 根据lane在warp中的位置调整共享内存索引
@@ -414,7 +430,7 @@ __global__ void compute_gemm_imma(const uint8_t *A, const uint8_t *B, const int 
                 // 推进全局内存指针和共享内存索引到下一个处理位置
                 // 全局内存：跳到下一组行
                 // 共享内存：跳到下一行
-                lane_ptr = (int4 *)((uint8_t *)lane_ptr + K_GLOBAL * CHUNK_COPY_LINES_PER_WARP);
+                lane_ptr = (int4 *)((uint8_t *)lane_ptr + k_global * CHUNK_COPY_LINES_PER_WARP);
                 shmem_idx += CHUNK_COPY_LINES_PER_WARP;
             }
 
@@ -544,7 +560,7 @@ __global__ void compute_gemm_imma(const uint8_t *A, const uint8_t *B, const int 
             // 执行128位对齐的向量化写入：共享内存 -> 全局内存
             // 每个lane负责传输一个int4（16字节）
             // 这确保了高效的内存带宽利用和合并访问
-            *((int4 *)(dst_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) + laneId) =
+            *((int4 *)(dst_gmem_warp_stream_ptr + global_mem_stride * i) + laneId) =
                 *((int4 *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId);
         }
 
@@ -594,9 +610,10 @@ __global__ void simple_wmma_gemm_imma(const uint8_t *a,
 {
     // 矩阵的leading dimensions（紧密排列，无转置）
     // Leading dimension是指在内存中访问下一行时需要跳过的元素数量
-    int lda = m_ld;  // A矩阵的leading dimension：A是M×K矩阵，行主序存储，每行有K个元素，但lda=m_ld表示整体矩阵布局
+    int lda = k_ld;  // A矩阵的leading dimension：A是M×K矩阵，行主序存储，每行有K个元素，注意这里和官方代码不同
     int ldb = k_ld;  // B矩阵的leading dimension：B是K×N矩阵，列主序存储，ldb表示存储时的跨度
     int ldc = n_ld;  // C矩阵的leading dimension：C是M×N矩阵，行主序存储，每行有N个元素
+
 
     // 使用2D网格进行分块，每个warp负责一个16x16的输出块
     int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;  // 当前warp在M维度的位置（行索引）
@@ -773,6 +790,14 @@ __host__ void init_host_matrices(uint8_t *a, uint8_t *b, int *c, int M_size, int
     }
 }
 
+
+
+
+
+
+
+
+
 // =============================================================================
 // 测试类型枚举
 // =============================================================================
@@ -782,6 +807,11 @@ enum GemmKernelType {
     SIMPLE,     // 简单WMMA实现
     OPTIMIZED   // 优化的共享内存实现
 };
+
+
+
+
+
 
 // =============================================================================
 // 主函数：执行IMMA Tensor Core GEMM性能基准测试
@@ -797,18 +827,11 @@ enum GemmKernelType {
  * 5. 收集和分析性能数据
  * 6. 清理资源并输出结果
  */
+
 int main(int argc, char **argv)
 {
     std::cout << "=== IMMA Tensor Core GEMM 性能基准测试 ===" << std::endl;
-    
-    // =============================================================================
-    // 配置参数：控制程序行为
-    // =============================================================================
-    const bool enable_cpu_verification = false;  
-    // 控制是否进行CPU验证：
-    // - true:  启用CPU验证，程序会运行CPU版本的GEMM进行结果验证（慢但准确）
-    // - false: 跳过CPU验证，只运行GPU版本进行性能测试（快速迭代）
-    
+
     // =============================================================================
     // CUDA设备初始化和能力检查
     // =============================================================================
@@ -842,20 +865,30 @@ int main(int argc, char **argv)
     std::cout << "多处理器数量: " << deviceProp.multiProcessorCount << std::endl;  // 影响并行度
     std::cout << "最大共享内存: " << (deviceProp.sharedMemPerBlock / 1024) << " KB" << std::endl;  // 影响优化kernel的可用性
 
+
+
     // =============================================================================
-    // 测试配置：定义要测试的矩阵大小
+    // 测试配置
     // =============================================================================
-    
+    // 控制是否进行CPU验证：
+    // - true:  启用CPU验证，程序会运行CPU版本的GEMM进行结果验证（慢但准确）
+    // - false: 跳过CPU验证，只运行GPU版本进行性能测试（快速迭代）
+    const bool enable_cpu_verification = false;  
+
     // 定义测试矩阵的维度列表
     // 矩阵大小会显著影响性能特征：
     // - 小矩阵(512-1024): 主要受启动开销影响
     // - 中矩阵(2048-4096): GPU利用率逐渐提高
     // - 大矩阵(8192+): 接近GPU峰值性能
     // std::vector<int> test_sizes = {4096, 8192};
-    // 可以启用更全面的测试：
     // std::vector<int> test_sizes = {512, 768, 1024, 1536, 2048, 2560, 3072, 4096, 8192, 16384};
-    // 似乎4096以下的矩阵大小会返回 code=700(cudaErrorIllegalAddress) "cudaDeviceSynchronize()" 的错误?
-    std::vector<int> test_sizes = {4096, 6144, 8192, 10240, 12288, 14336, 16384};
+    // std::vector<int> test_sizes = {4096, 6144, 8192, 10240, 12288, 14336, 16384};
+
+    std::vector<int> test_sizes = {512, 1024 , 2048, 4096, 8192, 12288, 16384};  //均为128倍数
+
+    // std::vector<int> test_sizes = {256, 320, 512, 528, 1024};  //非128的倍数
+
+
 
     std::cout << "测试矩阵维度: ";
     for (size_t i = 0; i < test_sizes.size(); i++) {
@@ -1008,47 +1041,20 @@ int main(int argc, char **argv)
         float time_simple = 0, time_optimized = 0;        // GPU执行时间(毫秒)
         double tops_simple = 0, tops_optimized = 0;       // GPU性能(TOPS = 万亿次操作/秒)
         double cpu_time_ms = 0, tops_cpu = 0;             // CPU性能指标
-        bool simple_vs_cpu_match = true, optimized_vs_cpu_match = true;  // 结果正确性标志
+        bool simple_vs_cpu_match = false, optimized_vs_cpu_match = false;  // 结果正确性标志 - 默认为false(未验证)
 
+        
         // =============================================================================
-        // 预热阶段：GPU预热和可选的CPU验证
+        //! 1) 预热阶段：GPU预热
         // =============================================================================
         /*
-         * 预热的重要性：
          * 1. GPU频率调节：现代GPU有动态频率，冷启动时运行在较低频率
          * 2. 驱动初始化：第一次CUDA调用会触发大量初始化工作
          * 3. 缓存预热：L2缓存、指令缓存需要预热
          * 4. 内存控制器优化：GPU内存控制器需要时间进入最佳状态
          */
         
-        if (enable_cpu_verification) {
-            std::cout << std::endl << "[预热阶段] 进行CPU验证和GPU预热..." << std::endl;
-            
-            // =============================================================================
-            // CPU验证：运行CPU版本作为正确性参考
-            // =============================================================================
-            std::cout << "执行CPU参考计算..." << std::endl;
-            memcpy(h_d_cpu, h_c, bytes_d);  // 复制C矩阵作为CPU计算的初始值
-            
-            // 使用高精度计时器测量CPU执行时间
-            auto cpu_start = std::chrono::high_resolution_clock::now();
-            matMultiplyOnHost(h_a, h_b, h_d_cpu, alpha, beta, size, size, size, size, size, size);
-            auto cpu_end = std::chrono::high_resolution_clock::now();
-            
-            // 计算CPU执行时间和性能
-            auto cpu_duration = std::chrono::duration_cast<std::chrono::milliseconds>(cpu_end - cpu_start);
-            cpu_time_ms = cpu_duration.count();
-            tops_cpu = (ops / (cpu_time_ms / 1000.0)) / 1e12;  // 转换为TOPS
-            std::cout << "CPU计算完成，时间: " << cpu_time_ms << " ms" << std::endl;
-        } else {
-            std::cout << std::endl << "[预热阶段] 跳过CPU验证，仅进行GPU预热..." << std::endl;
-            cpu_time_ms = 0;
-            tops_cpu = 0;
-        }
-
-        // =============================================================================
-        // GPU预热：让GPU进入最佳性能状态
-        // =============================================================================
+        std::cout << std::endl << "[预热阶段] 执行GPU预热..." << std::endl;
         std::cout << "执行GPU预热 (5次)..." << std::endl;
         
         // 配置CUDA执行参数：
@@ -1072,20 +1078,16 @@ int main(int argc, char **argv)
             // 清零输出矩阵，确保每次测试从干净状态开始
             checkCudaErrors(cudaMemset(d_d, 0, bytes_d));
             
-            // 启动简单WMMA kernel进行预热
+            //! 启动简单WMMA kernel进行预热
             // <<<gridDim, blockDim>>>: CUDA kernel启动语法
             // - gridDim: 网格大小，定义启动多少个block
             // - blockDim: 线程块大小，定义每个block有多少个线程
-            simple_wmma_gemm_imma<<<gridDim, blockDim>>>(d_a, d_b, d_c, d_d, size, size, size, alpha, beta);
+            checkKernelErrors((simple_wmma_gemm_imma<<<gridDim, blockDim>>>(d_a, d_b, d_c, d_d, size, size, size, alpha, beta)));
             
-            // 等待GPU计算完成
-            // cudaDeviceSynchronize(): 阻塞CPU直到GPU上所有操作完成
+            // kernel发射后，等待所有GPU操作完成
             checkCudaErrors(cudaDeviceSynchronize());
-            
-            // =============================================================================
-            // 优化版本预热（如果GPU支持足够的共享内存）
-            // =============================================================================
-            
+           
+            //! 启动优化版本WMMA kernel预热
             // 计算优化kernel所需的共享内存大小
             // 优化版本使用共享内存缓存数据，需要更多内存
             size_t SHMEM_SZ = MAX(sizeof(uint8_t) * (BLOCK_COL_TILES * M) * (CHUNK_K * K + SKEW_UINT8) * 2,
@@ -1105,47 +1107,26 @@ int main(int argc, char **argv)
                 // - deviceProp.multiProcessorCount: 使用GPU的SM数量作为网格大小
                 // - THREADS_PER_BLOCK: 每个block的线程数
                 // - SHMEM_SZ: 每个block使用的共享内存大小
-                compute_gemm_imma<<<deviceProp.multiProcessorCount, THREADS_PER_BLOCK, SHMEM_SZ>>>(
-                    d_a, d_b, d_c, d_d, alpha, beta);
+                // 计算当前矩阵的块数量
+                int m_tiles = size / 16;
+                int n_tiles = size / 16; 
+                int k_tiles = size / 16;
+                checkKernelErrors((compute_gemm_imma<<<deviceProp.multiProcessorCount, THREADS_PER_BLOCK, SHMEM_SZ>>>(
+                    d_a, d_b, d_c, d_d, m_tiles, n_tiles, k_tiles, alpha, beta)));
+
+                // kernel发射后，等待所有GPU操作完成
                 checkCudaErrors(cudaDeviceSynchronize());
             }
         }
+
         std::cout << "GPU预热完成" << std::endl;
 
-        // =============================================================================
-        // 预热结果验证（仅在启用CPU验证时）
-        // =============================================================================
-        if (enable_cpu_verification) {
-            // 将GPU计算结果复制回主机内存进行验证
-            checkCudaErrors(cudaMemcpy(h_d_gpu_simple, d_d, bytes_d, cudaMemcpyDeviceToHost));
-            
-            // 检查GPU结果与CPU参考结果是否匹配
-            // 只检查前100个元素以快速验证（完整验证会很慢）
-            bool warmup_correct = true;
-            for (int i = 0; i < std::min(100, size * size); i++) {
-                if (abs(h_d_gpu_simple[i] - h_d_cpu[i]) > 0) {
-                    warmup_correct = false;
-                    break;
-                }
-            }
-            if (warmup_correct) {
-                std::cout << "✓ GPU计算结果与CPU参考结果匹配" << std::endl;
-            } else {
-                std::cout << "✗ 警告: GPU计算结果与CPU参考结果不匹配" << std::endl;
-            }
-        } else {
-            std::cout << "✓ 跳过GPU结果验证（CPU验证已禁用）" << std::endl;
-        }
+
+
 
         // =============================================================================
-        // 性能测试1: 简单WMMA实现 (100次平均测量)
+        //! 2) 性能测试: 简单WMMA实现 (100次平均测量)
         // =============================================================================
-        /*
-         * 为什么要测量100次取平均：
-         * 1. 消除测量噪声：单次测量可能受系统影响有波动
-         * 2. 提高精度：GPU操作很快，多次测量提高时间精度
-         * 3. 统计意义：平均值更能反映真实性能
-         */
         std::cout << std::endl << "[性能测试1] 简单WMMA GEMM实现 (100次平均)" << std::endl;
         checkCudaErrors(cudaMemset(d_d, 0, bytes_d));
 
@@ -1155,9 +1136,7 @@ int main(int argc, char **argv)
 
         std::cout << "Grid配置: (" << gridDim.x << ", " << gridDim.y << "), Block配置: (" << blockDim.x << ", " << blockDim.y << ")" << std::endl;
 
-        // =============================================================================
         // CUDA事件：GPU端的高精度计时器
-        // =============================================================================
         /*
          * 为什么使用CUDA事件而不是CPU计时器：
          * 1. GPU端计时：直接测量GPU执行时间，不包括CPU-GPU通信延迟
@@ -1168,9 +1147,7 @@ int main(int argc, char **argv)
         checkCudaErrors(cudaEventCreate(&start));            // 创建开始事件
         checkCudaErrors(cudaEventCreate(&stop));             // 创建结束事件
         
-        // =============================================================================
         // 执行100次重复测试获取准确的平均性能
-        // =============================================================================
         const int num_tests = 100;                          // 测试次数
         float total_time = 0.0f;                            // 累计总时间
         
@@ -1208,9 +1185,7 @@ int main(int argc, char **argv)
         // 复制最后一次执行的结果到主机内存（用于后续验证）
         checkCudaErrors(cudaMemcpy(h_d_gpu_simple, d_d, bytes_d, cudaMemcpyDeviceToHost));
 
-        // =============================================================================
         // 性能指标计算和输出
-        // =============================================================================
         /*
          * TOPS计算公式详解：
          * TOPS = (总操作数 / 执行时间(秒)) / 10^12
@@ -1222,8 +1197,10 @@ int main(int argc, char **argv)
         std::cout << std::fixed << std::setprecision(3) << "执行时间: " << time_simple << " ms, " 
                   << std::setprecision(2) << "性能: " << tops_simple << " TOPS" << std::endl << std::defaultfloat;
 
+
+
         // =============================================================================
-        // 性能测试2: 优化WMMA实现 (100次平均测量)
+        //! 3) 性能测试: 优化WMMA实现 (100次平均测量)
         // =============================================================================
         /*
          * 优化版本与简单版本的主要区别：
@@ -1302,8 +1279,12 @@ int main(int argc, char **argv)
                      * - THREADS_PER_BLOCK: 每个线程块的线程数 
                      * - SHMEM_SZ: 动态共享内存大小（前面计算的值）
                      */
+                    // 计算当前矩阵的块数量
+                    int m_tiles = size / 16;
+                    int n_tiles = size / 16; 
+                    int k_tiles = size / 16;
                     compute_gemm_imma<<<deviceProp.multiProcessorCount, THREADS_PER_BLOCK, SHMEM_SZ>>>(
-                        d_a, d_b, d_c, d_d, alpha, beta);
+                        d_a, d_b, d_c, d_d, m_tiles, n_tiles, k_tiles, alpha, beta);
                     checkCudaErrors(cudaEventRecord(stop));
                     checkCudaErrors(cudaEventSynchronize(stop));
                     
@@ -1323,7 +1304,6 @@ int main(int argc, char **argv)
                 /*
                  * 性能指标计算 (严格按照官方代码公式)
                  * TOPS = (总操作数 / 执行时间秒) / 10^12
-                 * 
                  * 其中：
                  * - ops: 2*M*N*K个操作（每个输出元素需要K次乘加运算）
                  * - time_optimized/1000.0: 时间转换为秒
@@ -1331,6 +1311,7 @@ int main(int argc, char **argv)
                  */
                 tops_optimized = (ops / (time_optimized / 1000.0)) / 1e12;
                 std::cout << std::fixed << std::setprecision(3) << "执行时间: " << time_optimized << " ms, " << std::setprecision(2) << "性能: " << tops_optimized << " TOPS" << std::endl << std::defaultfloat;
+                
                 
                 /*
                  * 计算相对于简单版本的加速比
@@ -1348,6 +1329,90 @@ int main(int argc, char **argv)
                 std::cout << "跳过: 共享内存不足，需要 " << (SHMEM_SZ / 1024UL) << " KB，可用 " << (deviceProp.sharedMemPerMultiprocessor / 1024) << " KB" << std::endl;
                 memset(h_d_gpu_optimized, 0, bytes_d);
             }
+
+
+
+
+
+        // =============================================================================
+        //! 4) CPU验证和结果比较（在所有GPU测试完成后执行）
+        // =============================================================================
+        
+        if (enable_cpu_verification) {
+            std::cout << std::endl << "[CPU验证和结果比较]" << std::endl;
+            
+            // =============================================================================
+            // CPU验证：运行CPU版本作为正确性参考
+            // =============================================================================
+            std::cout << "执行CPU参考计算..." << std::endl;
+            memcpy(h_d_cpu, h_c, bytes_d);  // 复制C矩阵作为CPU计算的初始值
+            
+            // 使用高精度计时器测量CPU执行时间
+            auto cpu_start = std::chrono::high_resolution_clock::now();
+            matMultiplyOnHost(h_a, h_b, h_d_cpu, alpha, beta, size, size, size, size, size, size);
+            auto cpu_end = std::chrono::high_resolution_clock::now();
+            
+            // 计算CPU执行时间和性能
+            auto cpu_duration = std::chrono::duration_cast<std::chrono::milliseconds>(cpu_end - cpu_start);
+            cpu_time_ms = cpu_duration.count();
+            tops_cpu = (ops / (cpu_time_ms / 1000.0)) / 1e12;  // 转换为TOPS
+            std::cout << "CPU计算完成，时间: " << cpu_time_ms << " ms" << std::endl;
+            
+            // =============================================================================
+            // 简单版本结果验证
+            // =============================================================================
+            std::cout << "验证简单WMMA版本结果..." << std::endl;
+            simple_vs_cpu_match = true;
+            int error_count = 0;
+            for (int i = 0; i < size * size && error_count < 10; i++) {
+                if (abs(h_d_gpu_simple[i] - h_d_cpu[i]) > 0) {
+                    simple_vs_cpu_match = false;
+                    error_count++;
+                    if (error_count <= 5) {  // 只显示前5个错误
+                        std::cout << "位置[" << i << "]: GPU=" << h_d_gpu_simple[i] 
+                                  << ", CPU=" << h_d_cpu[i] << std::endl;
+                    }
+                }
+            }
+            if (simple_vs_cpu_match) {
+                std::cout << "✓ 简单WMMA版本与CPU参考结果匹配" << std::endl;
+            } else {
+                std::cout << "✗ 简单WMMA版本与CPU参考结果不匹配 (错误数量: " << error_count << ")" << std::endl;
+            }
+            
+            // =============================================================================
+            // 优化版本结果验证
+            // =============================================================================
+            if (time_optimized > 0) {
+                std::cout << "验证优化WMMA版本结果..." << std::endl;
+                optimized_vs_cpu_match = true;
+                error_count = 0;
+                for (int i = 0; i < size * size && error_count < 10; i++) {
+                    if (abs(h_d_gpu_optimized[i] - h_d_cpu[i]) > 0) {
+                        optimized_vs_cpu_match = false;
+                        error_count++;
+                        if (error_count <= 5) {  // 只显示前5个错误
+                            std::cout << "位置[" << i << "]: GPU=" << h_d_gpu_optimized[i] 
+                                      << ", CPU=" << h_d_cpu[i] << std::endl;
+                        }
+                    }
+                }
+                if (optimized_vs_cpu_match) {
+                    std::cout << "✓ 优化WMMA版本与CPU参考结果匹配" << std::endl;
+                } else {
+                    std::cout << "✗ 优化WMMA版本与CPU参考结果不匹配 (错误数量: " << error_count << ")" << std::endl;
+                }
+            } else {
+                std::cout << "- 优化版本未执行，跳过验证" << std::endl;
+                optimized_vs_cpu_match = false; // 未执行则标记为未匹配
+            }
+        } else {
+            std::cout << std::endl << "[结果验证] CPU验证已禁用，无法验证结果正确性" << std::endl;
+            simple_vs_cpu_match = false;    // 未验证则标记为未匹配
+            optimized_vs_cpu_match = false; // 未验证则标记为未匹配
+            cpu_time_ms = 0;
+            tops_cpu = 0;
+        }
 
         /*
          * =============================================================================
@@ -1404,13 +1469,21 @@ int main(int argc, char **argv)
          * =============================================================================
          * 结果验证状态说明
          * =============================================================================
-         * 说明当前测试是否进行了CPU验证
-         * 在性能测试中，CPU验证通常比较耗时，因此提供了开关选项
+         * 说明当前测试的结果验证状态
          */
+        std::cout << std::endl << "[结果验证状态]" << std::endl;
         if (enable_cpu_verification) {
-            std::cout << std::endl << "[结果验证] 已在预热阶段完成CPU验证" << std::endl;
+            std::cout << "CPU参考验证: ✓ 已完成" << std::endl;
+            std::cout << "简单版本验证: " << (simple_vs_cpu_match ? "✓ 通过" : "✗ 失败") << std::endl;
+            if (time_optimized > 0) {
+                std::cout << "优化版本验证: " << (optimized_vs_cpu_match ? "✓ 通过" : "✗ 失败") << std::endl;
+            } else {
+                std::cout << "优化版本验证: - 跳过（未执行）" << std::endl;
+            }
         } else {
-            std::cout << std::endl << "[结果验证] CPU验证已禁用，仅进行性能测试" << std::endl;
+            std::cout << "CPU参考验证: - 已禁用" << std::endl;
+            std::cout << "简单版本验证: - 跳过（CPU验证已禁用）" << std::endl;
+            std::cout << "优化版本验证: - 跳过（CPU验证已禁用）" << std::endl;
         }
 
         /*
