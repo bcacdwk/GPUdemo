@@ -57,7 +57,7 @@ int main(){
     cudaMalloc(&B, sizeof(mt) * n * k);
     cudaMalloc(&C, sizeof(rt) * n * m);
 
-    // 定义 GEMM 运算的标量 alpha 和 beta。公式为 C = alpha * A * B + beta * C
+    // 定义 GEMM 运算的标量 alpha 和 beta。公式为 C = alpha * op(A) * op(B) + beta * C
     st alpha = 1;
     st beta = 0;
     
@@ -75,22 +75,22 @@ int main(){
 
       // 调用 cuBLAS 的通用矩阵乘法函数 (GEMM)
       stat = cublasGemmEx(h,             // cuBLAS 句柄
-                               CUBLAS_OP_T,   // A 矩阵的操作：转置 (Transpose)
-                               CUBLAS_OP_N,   // B 矩阵的操作：不转置 (Non-transpose)
-                               m,             // 矩阵 A 和 C 的行数
-                               n,             // 矩阵 B 和 C 的列数
-                               k,             // 矩阵 A 的列数和 B 的行数
+                               CUBLAS_OP_T,   // A 矩阵转置，A(m,k)_row = A(k,m)_col，因此lda=k，转置变为A'(m,k)_col 
+                               CUBLAS_OP_N,   // B 矩阵不转置，B(n,k)_row = B(k,n)_col，因此ldb=k，因此注意这里的B在输入前其实是转置了一下，形状反一下
+                               m,             // op(A) = A' 和 C 的行数 = m，这里是操作后的维度，A'是 mxk_col
+                               n,             // op(B) = B 和 C 的列数 = n，这里是操作后的维度，B是 kxn_col
+                               k,             // A' 的列数和 B 的行数 = k
                                &alpha,        // 标量 alpha
                                A,             // 指向矩阵 A 的指针
                                Atype,         // 矩阵 A 的数据类型
-                               k,             // lda: A 矩阵的主维度 (leading dimension)，对于转置的 A(k,m)，主维度是 k
+                               k,             // lda: A 的主维度，和转置无关，在传入地址组织是确定为 k
                                B,             // 指向矩阵 B 的指针
                                Atype,         // 矩阵 B 的数据类型
-                               k,             // ldb: B 矩阵的主维度 (leading dimension)，对于 B(k,n)，主维度是 k
+                               k,             // ldb: B 的主维度，和转置无关，在传入地址组织是确定为 k
                                &beta,         // 标量 beta
                                C,             // 指向矩阵 C 的指针
                                Ctype,         // 矩阵 C 的数据类型
-                               m,             // ldc: C 矩阵的主维度 (leading dimension)，对于 C(m,n)，主维度是 m
+                               m,             // ldc: C 的主维度，由于是列主序，一定是行数 m
                                computeType,   // 计算过程中的数据类型
                                CUBLAS_GEMM_DEFAULT); // 使用默认的 GEMM 算法
       
