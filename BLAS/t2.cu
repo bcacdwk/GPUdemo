@@ -1,3 +1,6 @@
+// $ nvcc -o t2int8 t2.cu -lcublas -DUSE_INT8
+// $ nsys nvprof --print-gpu-trace ./t2int8
+
 #include <cublas_v2.h> // 引入 cuBLAS 库的头文件，这是使用 cuBLAS API 的必需文件
 #include <iostream>      // 引入 C++ 标准输入输出流库，用于打印结果
 #include <vector>        // 引入 C++ 标准向量库，用于存储待测试的矩阵维度

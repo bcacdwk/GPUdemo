@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/yanxia/hanyong/GPUdemo/BLAS/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
