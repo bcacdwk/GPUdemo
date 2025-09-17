@@ -1,4 +1,0 @@
-/home/yanxia/hanyong/GPUdemo/BLAS/build/CMakeFiles/matmul_example.dir
-/home/yanxia/hanyong/GPUdemo/BLAS/build/CMakeFiles/matmul_example_static.dir
-/home/yanxia/hanyong/GPUdemo/BLAS/build/CMakeFiles/edit_cache.dir
-/home/yanxia/hanyong/GPUdemo/BLAS/build/CMakeFiles/rebuild_cache.dir
