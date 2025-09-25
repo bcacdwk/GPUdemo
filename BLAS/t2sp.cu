@@ -1,6 +1,6 @@
 // 编译命令:
 // $ nvcc -o t2sp t2sp.cu -lcusparseLt
-// $ nsys nvprof --print-gpu-trace ./t2sp                  // 性能分析
+// $ nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=detail_res_t2sp ./t2sp
 
 /**
  * cuSPARSELt 结构化稀疏矩阵乘法示例程序
