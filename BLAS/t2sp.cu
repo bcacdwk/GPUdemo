@@ -93,7 +93,7 @@ int main(void) {
     //std::vector<int> dimensions = {512};
 
     // 每个维度下重复执行的次数，用于获取稳定的性能数据
-    const int num_runs = 100;
+    const int num_runs = 10;
     
     // 创建CUDA事件对象，用于精确测量GPU执行时间
     cudaEvent_t start, stop;
