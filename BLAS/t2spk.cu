@@ -1,6 +1,6 @@
 // 编译命令:
-// $ nvcc -o t2sp t2sp.cu -lcusparseLt
-// $ nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=detail_res_t2sp ./t2sp
+// $ nvcc -o t2spk t2spk.cu -lcusparseLt && ./t2spk
+// $ nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=detail_res_t2spk ./t2spk
 
 /**
  * cuSPARSELt 结构化稀疏矩阵乘法示例程序
@@ -89,8 +89,8 @@ struct cusparse_compute_type<int> {
 // ======================= 主函数开始 =======================
 int main(void) {
 
-    std::vector<int> dimensions = {512, 1024, 2048, 4096, 8192, 12288, 16384};
-    //std::vector<int> dimensions = {512};
+    //std::vector<int> dimensions = {512, 1024, 2048, 4096, 8192, 12288, 16384};
+    std::vector<int> dimensions = {1024};
 
     // 每个维度下重复执行的次数，用于获取稳定的性能数据
     const int num_runs = 10;
@@ -104,9 +104,9 @@ int main(void) {
     // 遍历所有测试维度，分别进行测试
     for (int dim : dimensions) {
 
-        int m = dim; // 矩阵A的行数，矩阵C的行数
-        int n = dim; // 矩阵B的列数，矩阵C的列数
-        int k = dim; // 矩阵A的列数，矩阵B的行数
+        int m = 65536; // 矩阵A的行数，矩阵C的行数
+        int n = 13824; // 矩阵B的列数，矩阵C的列数
+        int k = 2560; // 矩阵A的列数，矩阵B的行数
             
         std::cout << "正在测试矩阵维度: " << m << "x" << n << "x" << k << std::endl;
         
