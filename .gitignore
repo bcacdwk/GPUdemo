@@ -5,3 +5,11 @@ BLAS/*.exe
 BLAS/t2fp16
 BLAS/t2int8
 BLAS/t2sp_*
+
+# Profiling reports / traces
+*.ncu-rep
+*.nsys-rep
+*.nsys-report
+*.nsys-trace
+*.qdrep
+*.nvvp
