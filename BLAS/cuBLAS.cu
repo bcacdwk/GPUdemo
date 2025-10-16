@@ -1,4 +1,4 @@
-// $ nvcc -o t2int8 t2.cu -lcublas -DUSE_INT8
+// $ nvcc -o t2int8 t2.cu -lcublas -DUSE_INT8 && ./t2int8
 // $ nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=detail_res_t2int8 ./t2int8
 
 #include <cublas_v2.h> // 引入 cuBLAS 库的头文件，这是使用 cuBLAS API 的必需文件
@@ -95,7 +95,7 @@ int main(){
                                Ctype,         // 矩阵 C 的数据类型
                                m,             // ldc: C 的主维度，由于是列主序，一定是行数 m
                                computeType,   // 计算过程中的数据类型
-                               CUBLAS_GEMM_DEFAULT); // 使用默认的 GEMM 算法
+                               CUBLAS_GEMM_AUTOTUNE); // 调优算法；CUBLAS_GEMM_DEFAULT 使用默认的 GEMM 算法
       
       // 在 CUDA 流中插入一个结束计时的事件点
       cudaEventRecord(stop);

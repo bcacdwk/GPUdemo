@@ -1,6 +1,6 @@
 // 稀疏在左
-// $ nvcc -o t2spk_L_search t2spk_L_search.cu -lcusparseLt && ./t2spk_L_search
-// $ nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=nsys_t2spk_L ./t2spk_L_search
+// $ nvcc -o sparse_L_search sparse_L_search.cu -lcusparseLt && ./sparse_L_search
+// $ nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=nsys_sparse_L ./sparse_L_search
 
 /**
  * cuSPARSELt 结构化稀疏矩阵乘法示例程序
@@ -103,8 +103,8 @@ int main(void) {
 
     // 遍历所有测试维度，分别进行测试
     for (int dim : dimensions) {
-
-        int m = 13824; // 矩阵A的行数，矩阵C的行数
+        // 65536; 13824; 6912; 5120; 3840; 2560
+        int m = 65536; // 矩阵A的行数，矩阵C的行数
         int n = 13824; // 矩阵B的列数，矩阵C的列数
         int k = 2560; // 矩阵A的列数，矩阵B的行数
             
@@ -118,18 +118,19 @@ int main(void) {
                     
         // -------------------- 第1步：问题参数定义 --------------------
         // 矩阵存储和操作参数配置（可改动）
-        //CUSPARSE_ORDER_COL; CUSPARSE_ORDER_ROW; CUSPARSE_OPERATION_TRANSPOSE; CUSPARSE_OPERATION_NON_TRANSPOSE;
-        auto     orderA          = CUSPARSE_ORDER_COL;              // A 主序存储
+        //CUSPARSE_ORDER_COL; CUSPARSE_ORDER_ROW;
+        //CUSPARSE_OPERATION_TRANSPOSE; CUSPARSE_OPERATION_NON_TRANSPOSE;
+        auto     orderA          = CUSPARSE_ORDER_ROW;              // A 主序存储
         auto     orderB          = CUSPARSE_ORDER_ROW;              // B 主序存储
-        auto     orderC          = CUSPARSE_ORDER_COL;              // C 主序存储
-        auto     opA            = CUSPARSE_OPERATION_TRANSPOSE;     // A 矩阵操作
+        auto     orderC          = CUSPARSE_ORDER_ROW;              // C 主序存储
+        auto     opA            = CUSPARSE_OPERATION_NON_TRANSPOSE;     // A 矩阵操作
         auto     opB            = CUSPARSE_OPERATION_TRANSPOSE;     // B 矩阵操作
         auto     type_AB        = cuda_type<AB_t>::value;       // A, B 矩阵的 CUDA 数据类型
         auto     type_C         = cuda_type<C_t>::value;        // C 矩阵的 CUDA 数据类型
         auto     compute_type   = cusparse_compute_type<COMPUTE_t>::value; // 计算精度
         bool     matmul_search  = true;                         // 是否启用算法搜索优化
         int      search_iter    = 20;                            // 自定义搜索迭代次数（0 表示默认）
-        int      alg_id         = -1;                           // 指定算法ID（-1 表示自动搜索）
+        int      alg_id         = 0;                           // 指定算法ID（-1 表示自动搜索）
         
         // 根据转置操作计算实际的矩阵布局
         bool     isA_rowmajor    = (orderA == CUSPARSE_ORDER_ROW);      // A是否行主序
