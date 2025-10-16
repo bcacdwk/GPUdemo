@@ -1,6 +1,6 @@
-// 编译命令:
-// $ nvcc -o t2sp t2sp.cu -lcusparseLt && ./t2sp
-// $ nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=nsys_t2sp ./t2sp
+// 稀疏在左
+// $ nvcc -o t2spk_L t2spk_L.cu -lcusparseLt && ./t2spk_L
+// $ nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=nsys_t2spk_L ./t2spk_L
 
 /**
  * cuSPARSELt 结构化稀疏矩阵乘法示例程序
@@ -89,8 +89,8 @@ struct cusparse_compute_type<int> {
 // ======================= 主函数开始 =======================
 int main(void) {
 
-    std::vector<int> dimensions = {512, 1024, 2048, 4096, 8192, 12288, 16384};
-    //std::vector<int> dimensions = {512};
+    //std::vector<int> dimensions = {512, 1024, 2048, 4096, 8192, 12288, 16384};
+    std::vector<int> dimensions = {1024};
 
     // 每个维度下重复执行的次数，用于获取稳定的性能数据
     const int num_runs = 10;
@@ -104,9 +104,9 @@ int main(void) {
     // 遍历所有测试维度，分别进行测试
     for (int dim : dimensions) {
 
-        int m = dim; // 矩阵A的行数，矩阵C的行数
-        int n = dim; // 矩阵B的列数，矩阵C的列数
-        int k = dim; // 矩阵A的列数，矩阵B的行数
+        int m = 65536; // 矩阵A的行数，矩阵C的行数
+        int n = 13824; // 矩阵B的列数，矩阵C的列数
+        int k = 2560; // 矩阵A的列数，矩阵B的行数
             
         std::cout << "正在测试矩阵维度: " << m << "x" << n << "x" << k << std::endl;
         
@@ -117,17 +117,21 @@ int main(void) {
                   << total_mem / (1024*1024) << " MB" << std::endl;
                     
         // -------------------- 第1步：问题参数定义 --------------------
-        // 矩阵存储和操作参数配置
-        auto     order          = CUSPARSE_ORDER_ROW;           // 行主序存储
-        auto     opA            = CUSPARSE_OPERATION_NON_TRANSPOSE; // A 矩阵不转置
-        auto     opB            = CUSPARSE_OPERATION_TRANSPOSE;     // B 矩阵转置
+        // 矩阵存储和操作参数配置（可改动）
+        auto     orderA          = CUSPARSE_ORDER_COL;              // A 主序存储
+        auto     orderB          = CUSPARSE_ORDER_COL;              // B 主序存储
+        auto     orderC          = CUSPARSE_ORDER_COL;              // C 主序存储
+        auto     opA            = CUSPARSE_OPERATION_TRANSPOSE;     // A 矩阵操作
+        auto     opB            = CUSPARSE_OPERATION_NON_TRANSPOSE;     // B 矩阵操作
         auto     type_AB        = cuda_type<AB_t>::value;       // A, B 矩阵的 CUDA 数据类型
         auto     type_C         = cuda_type<C_t>::value;        // C 矩阵的 CUDA 数据类型
         auto     compute_type   = cusparse_compute_type<COMPUTE_t>::value; // 计算精度
         bool     matmul_search  = true;                         // 是否启用算法搜索优化
         
         // 根据转置操作计算实际的矩阵布局
-        bool     is_rowmajor    = (order == CUSPARSE_ORDER_ROW);      // 是否行主序
+        bool     isA_rowmajor    = (orderA == CUSPARSE_ORDER_ROW);      // A是否行主序
+        bool     isB_rowmajor    = (orderB == CUSPARSE_ORDER_ROW);      // B是否行主序
+        bool     isC_rowmajor    = (orderC == CUSPARSE_ORDER_ROW);      // C是否行主序
         bool     isA_transposed = (opA != CUSPARSE_OPERATION_NON_TRANSPOSE); // A 是否转置
         bool     isB_transposed = (opB != CUSPARSE_OPERATION_NON_TRANSPOSE); // B 是否转置
         // 考虑转置操作后的实际矩阵维度
@@ -143,15 +147,15 @@ int main(void) {
         
         // 计算 leading dimension（矩阵存储时每行的跨度）
         // 行主序：lda = 列数，列主序：lda = 行数
-        auto     lda            = (is_rowmajor) ? num_A_cols : num_A_rows; // A 的 leading dimension
-        auto     ldb            = (is_rowmajor) ? num_B_cols : num_B_rows; // B 的 leading dimension  
-        auto     ldc            = (is_rowmajor) ? num_C_cols : num_C_rows; // C 的 leading dimension
-        
+        auto     lda            = (isA_rowmajor) ? num_A_cols : num_A_rows; // A 的 leading dimension
+        auto     ldb            = (isB_rowmajor) ? num_B_cols : num_B_rows; // B 的 leading dimension  
+        auto     ldc            = (isC_rowmajor) ? num_C_cols : num_C_rows; // C 的 leading dimension
+
         // 计算实际需要分配的矩阵高度（考虑存储顺序）
-        auto     A_height       = (is_rowmajor) ? num_A_rows : num_A_cols;
-        auto     B_height       = (is_rowmajor) ? num_B_rows : num_B_cols;
-        auto     C_height       = (is_rowmajor) ? num_C_rows : num_C_cols;
-        
+        auto     A_height       = (isA_rowmajor) ? num_A_rows : num_A_cols;
+        auto     B_height       = (isB_rowmajor) ? num_B_rows : num_B_cols;
+        auto     C_height       = (isC_rowmajor) ? num_C_rows : num_C_cols;
+
         // 计算各矩阵需要的内存大小（字节）
         auto     A_size         = A_height * lda * sizeof(AB_t);
         auto     B_size         = B_height * ldb * sizeof(AB_t);
@@ -222,20 +226,20 @@ int main(void) {
         CHECK_CUSPARSE( cusparseLtStructuredDescriptorInit(
                                                 &handle, &matA, num_A_rows,  // 句柄，描述符，行数
                                                 num_A_cols, lda, alignment, // 列数，leading dimension，对齐
-                                                type_AB, order,             // 数据类型，存储顺序
+                                                type_AB, orderA,             // 数据类型，存储顺序
                                                 CUSPARSELT_SPARSITY_50_PERCENT) ) // 50% 稀疏度
 
         // 初始化矩阵 B 的描述符（稠密矩阵）
         CHECK_CUSPARSE( cusparseLtDenseDescriptorInit(
                                                 &handle, &matB, num_B_rows,  // 句柄，描述符，行数
-                                                num_B_cols, ldb, alignment, // 列数，leading dimension，对齐  
-                                                type_AB, order) )           // 数据类型，存储顺序
-                                                
-        // 初始化矩阵 C 的描述符（稠密矩阵，存储结果）                                        
+                                                num_B_cols, ldb, alignment, // 列数，leading dimension，对齐
+                                                type_AB, orderB) )           // 数据类型，存储顺序
+
+        // 初始化矩阵 C 的描述符（稠密矩阵，存储结果）
         CHECK_CUSPARSE( cusparseLtDenseDescriptorInit(
                                                 &handle, &matC, num_C_rows,  // 句柄，描述符，行数
                                                 num_C_cols, ldc, alignment, // 列数，leading dimension，对齐
-                                                type_C, order) )            // 数据类型，存储顺序
+                                                type_C, orderC) )            // 数据类型，存储顺序
 
         // -------------------- 第七步：矩阵乘法操作配置 --------------------
         // 配置矩阵乘法的具体参数和执行策略
@@ -313,7 +317,7 @@ int main(void) {
         CHECK_CUSPARSE( cusparseLtSpMMACompress(&handle, &plan, dA, dA_compressed, // 从原始 A 压缩到 dA_compressed
                                                 dA_compressedBuffer,stream) )      // 使用临时缓冲区
 
-        // -------------------- 第十步：算法搜索优化 --------------------
+        // -------------------- 第十步：算法搜索优化（可选） --------------------
         // cuSPARSELt 支持多种算法实现，可以搜索最优算法以获得最佳性能
         
         int           num_streams = 0;      // 不使用多流并行
@@ -406,8 +410,8 @@ int main(void) {
             CHECK_CUDA( cudaMemcpy(hA, dA, A_size, cudaMemcpyDeviceToHost) )
 
             // 确定矩阵的内存布局（用于正确访问矩阵元素）
-            bool A_std_layout = (is_rowmajor != isA_transposed); // A 是否为标准布局
-            bool B_std_layout = (is_rowmajor != isB_transposed); // B 是否为标准布局
+            bool A_std_layout = (isA_rowmajor != isA_transposed); // A 是否为标准布局
+            bool B_std_layout = (isB_rowmajor != isB_transposed); // B 是否为标准布局
 
             // 在 CPU 上计算参考结果进行对比
             C_t* hC_result = new C_t[C_height * ldc]; // 分配 CPU 计算结果的存储空间
@@ -427,7 +431,7 @@ int main(void) {
                     }
                     
                     // 计算最终结果：C = α * A * B
-                    auto posC       = (is_rowmajor) ? i * ldc + j : i + j * ldc;  // C 的位置
+                    auto posC       = (isC_rowmajor) ? i * ldc + j : i + j * ldc;  // C 的位置
                     hC_result[posC] = static_cast<C_t>(alpha * sum);
                 }
             }
@@ -439,7 +443,7 @@ int main(void) {
             int correct = 1; // 正确性标志
             for (int i = 0; i < m; i++) {
                 for (int j = 0; j < n; j++) {
-                    auto pos          = (is_rowmajor) ? i * ldc + j : i + j * ldc;
+                    auto pos          = (isC_rowmajor) ? i * ldc + j : i + j * ldc;
                     auto device_value = hC[pos];     // GPU 计算结果
                     auto host_value   = hC_result[pos]; // CPU 参考结果
                     

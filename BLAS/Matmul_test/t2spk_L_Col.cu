@@ -1,6 +1,6 @@
-// 编译命令:
-// $ nvcc -o t2sp t2sp.cu -lcusparseLt && ./t2sp
-// $ nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=nsys_t2sp ./t2sp
+// 稀疏在左，列主序T/N，优化算法
+// $ nvcc -o t2spk_L_Col t2spk_L_Col.cu -lcusparseLt && ./t2spk_L_Col
+// $ nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=detail_res_t2spk_L_Col ./t2spk_L_Col
 
 /**
  * cuSPARSELt 结构化稀疏矩阵乘法示例程序
@@ -89,8 +89,8 @@ struct cusparse_compute_type<int> {
 // ======================= 主函数开始 =======================
 int main(void) {
 
-    std::vector<int> dimensions = {512, 1024, 2048, 4096, 8192, 12288, 16384};
-    //std::vector<int> dimensions = {512};
+    //std::vector<int> dimensions = {512, 1024, 2048, 4096, 8192, 12288, 16384};
+    std::vector<int> dimensions = {1024};
 
     // 每个维度下重复执行的次数，用于获取稳定的性能数据
     const int num_runs = 10;
@@ -104,9 +104,9 @@ int main(void) {
     // 遍历所有测试维度，分别进行测试
     for (int dim : dimensions) {
 
-        int m = dim; // 矩阵A的行数，矩阵C的行数
-        int n = dim; // 矩阵B的列数，矩阵C的列数
-        int k = dim; // 矩阵A的列数，矩阵B的行数
+        int m = 65536; // 矩阵A的行数，矩阵C的行数
+        int n = 13824; // 矩阵B的列数，矩阵C的列数
+        int k = 2560; // 矩阵A的列数，矩阵B的行数
             
         std::cout << "正在测试矩阵维度: " << m << "x" << n << "x" << k << std::endl;
         
@@ -118,9 +118,9 @@ int main(void) {
                     
         // -------------------- 第1步：问题参数定义 --------------------
         // 矩阵存储和操作参数配置
-        auto     order          = CUSPARSE_ORDER_ROW;           // 行主序存储
-        auto     opA            = CUSPARSE_OPERATION_NON_TRANSPOSE; // A 矩阵不转置
-        auto     opB            = CUSPARSE_OPERATION_TRANSPOSE;     // B 矩阵转置
+        auto     order          = CUSPARSE_ORDER_COL;           // 列主序存储
+        auto     opA            = CUSPARSE_OPERATION_TRANSPOSE; // A 矩阵转置
+        auto     opB            = CUSPARSE_OPERATION_NON_TRANSPOSE;     // B 矩阵不转置
         auto     type_AB        = cuda_type<AB_t>::value;       // A, B 矩阵的 CUDA 数据类型
         auto     type_C         = cuda_type<C_t>::value;        // C 矩阵的 CUDA 数据类型
         auto     compute_type   = cusparse_compute_type<COMPUTE_t>::value; // 计算精度
@@ -313,7 +313,7 @@ int main(void) {
         CHECK_CUSPARSE( cusparseLtSpMMACompress(&handle, &plan, dA, dA_compressed, // 从原始 A 压缩到 dA_compressed
                                                 dA_compressedBuffer,stream) )      // 使用临时缓冲区
 
-        // -------------------- 第十步：算法搜索优化 --------------------
+        // -------------------- 第十步：算法搜索优化（可选） --------------------
         // cuSPARSELt 支持多种算法实现，可以搜索最优算法以获得最佳性能
         
         int           num_streams = 0;      // 不使用多流并行

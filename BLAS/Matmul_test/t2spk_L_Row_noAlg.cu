@@ -1,6 +1,6 @@
-// 编译命令:
-// $ nvcc -o t2sp t2sp.cu -lcusparseLt && ./t2sp
-// $ nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=nsys_t2sp ./t2sp
+// 稀疏在左，行主序N/T，不优化算法
+// $ nvcc -o t2spk_L_Row_noAlg t2spk_L_Row_noAlg.cu -lcusparseLt && ./t2spk_L_Row_noAlg
+// $ nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=detail_res_t2spk_L_Row_noAlg ./t2spk_L_Row_noAlg
 
 /**
  * cuSPARSELt 结构化稀疏矩阵乘法示例程序
@@ -89,8 +89,8 @@ struct cusparse_compute_type<int> {
 // ======================= 主函数开始 =======================
 int main(void) {
 
-    std::vector<int> dimensions = {512, 1024, 2048, 4096, 8192, 12288, 16384};
-    //std::vector<int> dimensions = {512};
+    //std::vector<int> dimensions = {512, 1024, 2048, 4096, 8192, 12288, 16384};
+    std::vector<int> dimensions = {1024};
 
     // 每个维度下重复执行的次数，用于获取稳定的性能数据
     const int num_runs = 10;
@@ -104,9 +104,9 @@ int main(void) {
     // 遍历所有测试维度，分别进行测试
     for (int dim : dimensions) {
 
-        int m = dim; // 矩阵A的行数，矩阵C的行数
-        int n = dim; // 矩阵B的列数，矩阵C的列数
-        int k = dim; // 矩阵A的列数，矩阵B的行数
+        int m = 65536; // 矩阵A的行数，矩阵C的行数
+        int n = 13824; // 矩阵B的列数，矩阵C的列数
+        int k = 2560; // 矩阵A的列数，矩阵B的行数
             
         std::cout << "正在测试矩阵维度: " << m << "x" << n << "x" << k << std::endl;
         
@@ -124,7 +124,7 @@ int main(void) {
         auto     type_AB        = cuda_type<AB_t>::value;       // A, B 矩阵的 CUDA 数据类型
         auto     type_C         = cuda_type<C_t>::value;        // C 矩阵的 CUDA 数据类型
         auto     compute_type   = cusparse_compute_type<COMPUTE_t>::value; // 计算精度
-        bool     matmul_search  = true;                         // 是否启用算法搜索优化
+        bool     matmul_search  = false;                         // 是否启用算法搜索优化
         
         // 根据转置操作计算实际的矩阵布局
         bool     is_rowmajor    = (order == CUSPARSE_ORDER_ROW);      // 是否行主序
@@ -313,7 +313,7 @@ int main(void) {
         CHECK_CUSPARSE( cusparseLtSpMMACompress(&handle, &plan, dA, dA_compressed, // 从原始 A 压缩到 dA_compressed
                                                 dA_compressedBuffer,stream) )      // 使用临时缓冲区
 
-        // -------------------- 第十步：算法搜索优化 --------------------
+        // -------------------- 第十步：算法搜索优化（可选） --------------------
         // cuSPARSELt 支持多种算法实现，可以搜索最优算法以获得最佳性能
         
         int           num_streams = 0;      // 不使用多流并行

@@ -1,6 +1,6 @@
-// 编译命令:
-// $ nvcc -o t2spk t2spk.cu -lcusparseLt && ./t2spk
-// $ nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=detail_res_t2spk ./t2spk
+// 稀疏在左
+// $ nvcc -o t2spk_L_search t2spk_L_search.cu -lcusparseLt && ./t2spk_L_search
+// $ nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=nsys_t2spk_L ./t2spk_L_search
 
 /**
  * cuSPARSELt 结构化稀疏矩阵乘法示例程序
@@ -104,7 +104,7 @@ int main(void) {
     // 遍历所有测试维度，分别进行测试
     for (int dim : dimensions) {
 
-        int m = 65536; // 矩阵A的行数，矩阵C的行数
+        int m = 13824; // 矩阵A的行数，矩阵C的行数
         int n = 13824; // 矩阵B的列数，矩阵C的列数
         int k = 2560; // 矩阵A的列数，矩阵B的行数
             
@@ -117,17 +117,24 @@ int main(void) {
                   << total_mem / (1024*1024) << " MB" << std::endl;
                     
         // -------------------- 第1步：问题参数定义 --------------------
-        // 矩阵存储和操作参数配置
-        auto     order          = CUSPARSE_ORDER_ROW;           // 行主序存储（比列更快）
-        auto     opA            = CUSPARSE_OPERATION_NON_TRANSPOSE; // A 矩阵不转置
-        auto     opB            = CUSPARSE_OPERATION_TRANSPOSE;     // B 矩阵转置
+        // 矩阵存储和操作参数配置（可改动）
+        //CUSPARSE_ORDER_COL; CUSPARSE_ORDER_ROW; CUSPARSE_OPERATION_TRANSPOSE; CUSPARSE_OPERATION_NON_TRANSPOSE;
+        auto     orderA          = CUSPARSE_ORDER_COL;              // A 主序存储
+        auto     orderB          = CUSPARSE_ORDER_ROW;              // B 主序存储
+        auto     orderC          = CUSPARSE_ORDER_COL;              // C 主序存储
+        auto     opA            = CUSPARSE_OPERATION_TRANSPOSE;     // A 矩阵操作
+        auto     opB            = CUSPARSE_OPERATION_TRANSPOSE;     // B 矩阵操作
         auto     type_AB        = cuda_type<AB_t>::value;       // A, B 矩阵的 CUDA 数据类型
         auto     type_C         = cuda_type<C_t>::value;        // C 矩阵的 CUDA 数据类型
         auto     compute_type   = cusparse_compute_type<COMPUTE_t>::value; // 计算精度
         bool     matmul_search  = true;                         // 是否启用算法搜索优化
+        int      search_iter    = 20;                            // 自定义搜索迭代次数（0 表示默认）
+        int      alg_id         = -1;                           // 指定算法ID（-1 表示自动搜索）
         
         // 根据转置操作计算实际的矩阵布局
-        bool     is_rowmajor    = (order == CUSPARSE_ORDER_ROW);      // 是否行主序
+        bool     isA_rowmajor    = (orderA == CUSPARSE_ORDER_ROW);      // A是否行主序
+        bool     isB_rowmajor    = (orderB == CUSPARSE_ORDER_ROW);      // B是否行主序
+        bool     isC_rowmajor    = (orderC == CUSPARSE_ORDER_ROW);      // C是否行主序
         bool     isA_transposed = (opA != CUSPARSE_OPERATION_NON_TRANSPOSE); // A 是否转置
         bool     isB_transposed = (opB != CUSPARSE_OPERATION_NON_TRANSPOSE); // B 是否转置
         // 考虑转置操作后的实际矩阵维度
@@ -143,15 +150,15 @@ int main(void) {
         
         // 计算 leading dimension（矩阵存储时每行的跨度）
         // 行主序：lda = 列数，列主序：lda = 行数
-        auto     lda            = (is_rowmajor) ? num_A_cols : num_A_rows; // A 的 leading dimension
-        auto     ldb            = (is_rowmajor) ? num_B_cols : num_B_rows; // B 的 leading dimension  
-        auto     ldc            = (is_rowmajor) ? num_C_cols : num_C_rows; // C 的 leading dimension
-        
+        auto     lda            = (isA_rowmajor) ? num_A_cols : num_A_rows; // A 的 leading dimension
+        auto     ldb            = (isB_rowmajor) ? num_B_cols : num_B_rows; // B 的 leading dimension  
+        auto     ldc            = (isC_rowmajor) ? num_C_cols : num_C_rows; // C 的 leading dimension
+
         // 计算实际需要分配的矩阵高度（考虑存储顺序）
-        auto     A_height       = (is_rowmajor) ? num_A_rows : num_A_cols;
-        auto     B_height       = (is_rowmajor) ? num_B_rows : num_B_cols;
-        auto     C_height       = (is_rowmajor) ? num_C_rows : num_C_cols;
-        
+        auto     A_height       = (isA_rowmajor) ? num_A_rows : num_A_cols;
+        auto     B_height       = (isB_rowmajor) ? num_B_rows : num_B_cols;
+        auto     C_height       = (isC_rowmajor) ? num_C_rows : num_C_cols;
+
         // 计算各矩阵需要的内存大小（字节）
         auto     A_size         = A_height * lda * sizeof(AB_t);
         auto     B_size         = B_height * ldb * sizeof(AB_t);
@@ -222,20 +229,20 @@ int main(void) {
         CHECK_CUSPARSE( cusparseLtStructuredDescriptorInit(
                                                 &handle, &matA, num_A_rows,  // 句柄，描述符，行数
                                                 num_A_cols, lda, alignment, // 列数，leading dimension，对齐
-                                                type_AB, order,             // 数据类型，存储顺序
+                                                type_AB, orderA,             // 数据类型，存储顺序
                                                 CUSPARSELT_SPARSITY_50_PERCENT) ) // 50% 稀疏度
 
         // 初始化矩阵 B 的描述符（稠密矩阵）
         CHECK_CUSPARSE( cusparseLtDenseDescriptorInit(
                                                 &handle, &matB, num_B_rows,  // 句柄，描述符，行数
-                                                num_B_cols, ldb, alignment, // 列数，leading dimension，对齐  
-                                                type_AB, order) )           // 数据类型，存储顺序
-                                                
-        // 初始化矩阵 C 的描述符（稠密矩阵，存储结果）                                        
+                                                num_B_cols, ldb, alignment, // 列数，leading dimension，对齐
+                                                type_AB, orderB) )           // 数据类型，存储顺序
+
+        // 初始化矩阵 C 的描述符（稠密矩阵，存储结果）
         CHECK_CUSPARSE( cusparseLtDenseDescriptorInit(
                                                 &handle, &matC, num_C_rows,  // 句柄，描述符，行数
                                                 num_C_cols, ldc, alignment, // 列数，leading dimension，对齐
-                                                type_C, order) )            // 数据类型，存储顺序
+                                                type_C, orderC) )            // 数据类型，存储顺序
 
         // -------------------- 第七步：矩阵乘法操作配置 --------------------
         // 配置矩阵乘法的具体参数和执行策略
@@ -250,6 +257,25 @@ int main(void) {
         CHECK_CUSPARSE( cusparseLtMatmulAlgSelectionInit(
                                                 &handle, &alg_sel, &matmul,     // 句柄，算法选择，矩阵乘法描述符
                                                 CUSPARSELT_MATMUL_ALG_DEFAULT) ) // 使用默认算法
+
+        if (search_iter > 0) {
+            std::cout << "自定义搜索迭代次数: " << search_iter << std::endl;
+            CHECK_CUSPARSE( cusparseLtMatmulAlgSetAttribute(
+                                                &handle, &alg_sel,
+                                                CUSPARSELT_MATMUL_SEARCH_ITERATIONS,
+                                                &search_iter,
+                                                sizeof(search_iter)) )
+        }
+
+        if (alg_id >= 0) {
+            std::cout << "指定算法ID: " << alg_id << std::endl;
+            CHECK_CUSPARSE( cusparseLtMatmulAlgSetAttribute(
+                                                &handle, &alg_sel,
+                                                CUSPARSELT_MATMUL_ALG_CONFIG_ID,
+                                                &alg_id,
+                                                sizeof(alg_id)) )
+            matmul_search = false;
+        }
 
         // 初始化执行计划，将所有配置组合成可执行的计划
         CHECK_CUSPARSE( cusparseLtMatmulPlanInit(&handle, &plan, &matmul, &alg_sel))
@@ -322,14 +348,33 @@ int main(void) {
         if (matmul_search) {
             // 执行算法搜索，尝试不同的实现并选择最快的
             // 注意：搜索过程会修改 dC，所以之后需要重新初始化 dC
+
+            std::cout << "正在进行算法搜索优化..." << std::endl;
             CHECK_CUSPARSE( cusparseLtMatmulSearch(&handle, &plan, &alpha,      // 句柄，计划，α
                                                 dA_compressed, dB, &beta,    // 压缩的A，矩阵B，β  
                                                 dC, dD, nullptr,             // 输入C，输出D，无偏置
                                                 streams, num_streams) )      // 流配置
+
+            int tuned_alg_id = -1;
+            int alg_space    = 0;
+            CHECK_CUSPARSE( cusparseLtMatmulAlgGetAttribute(
+                                                &handle, &alg_sel,
+                                                CUSPARSELT_MATMUL_ALG_CONFIG_ID,
+                                                &tuned_alg_id,
+                                                sizeof(tuned_alg_id)) )
+            CHECK_CUSPARSE( cusparseLtMatmulAlgGetAttribute(
+                                                &handle, &alg_sel,
+                                                CUSPARSELT_MATMUL_ALG_CONFIG_MAX_ID,
+                                                &alg_space,
+                                                sizeof(alg_space)) )
+            std::cout << "自动调优选择的算法ID: " << tuned_alg_id << std::endl;
+            std::cout << "可用算法总数: " << alg_space << std::endl;
             
             // 重置 dC，因为搜索过程中 dC 的值已被修改
             // 为了后续的正确性检查，需要恢复原始值
             CHECK_CUDA( cudaMemcpy(dC, hC, C_size, cudaMemcpyHostToDevice) )
+        } else if (alg_id >= 0) {
+            std::cout << "使用指定算法ID: " << alg_id << std::endl;
         }
 
         // -------------------- 第十一步：执行矩阵乘法 --------------------
@@ -406,8 +451,8 @@ int main(void) {
             CHECK_CUDA( cudaMemcpy(hA, dA, A_size, cudaMemcpyDeviceToHost) )
 
             // 确定矩阵的内存布局（用于正确访问矩阵元素）
-            bool A_std_layout = (is_rowmajor != isA_transposed); // A 是否为标准布局
-            bool B_std_layout = (is_rowmajor != isB_transposed); // B 是否为标准布局
+            bool A_std_layout = (isA_rowmajor != isA_transposed); // A 是否为标准布局
+            bool B_std_layout = (isB_rowmajor != isB_transposed); // B 是否为标准布局
 
             // 在 CPU 上计算参考结果进行对比
             C_t* hC_result = new C_t[C_height * ldc]; // 分配 CPU 计算结果的存储空间
@@ -427,7 +472,7 @@ int main(void) {
                     }
                     
                     // 计算最终结果：C = α * A * B
-                    auto posC       = (is_rowmajor) ? i * ldc + j : i + j * ldc;  // C 的位置
+                    auto posC       = (isC_rowmajor) ? i * ldc + j : i + j * ldc;  // C 的位置
                     hC_result[posC] = static_cast<C_t>(alpha * sum);
                 }
             }
@@ -439,7 +484,7 @@ int main(void) {
             int correct = 1; // 正确性标志
             for (int i = 0; i < m; i++) {
                 for (int j = 0; j < n; j++) {
-                    auto pos          = (is_rowmajor) ? i * ldc + j : i + j * ldc;
+                    auto pos          = (isC_rowmajor) ? i * ldc + j : i + j * ldc;
                     auto device_value = hC[pos];     // GPU 计算结果
                     auto host_value   = hC_result[pos]; // CPU 参考结果
                     
