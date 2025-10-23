@@ -130,7 +130,7 @@ int main(void) {
         auto     compute_type   = cusparse_compute_type<COMPUTE_t>::value; // 计算精度
         bool     matmul_search  = true;                         // 是否启用算法搜索优化
         int      search_iter    = 20;                            // 自定义搜索迭代次数（0 表示默认）
-        int      alg_id         = 0;                           // 指定算法ID（-1 表示自动搜索）
+        int      alg_id         = -1;                           // 指定算法ID（-1 表示自动搜索）
         
         // 根据转置操作计算实际的矩阵布局
         bool     isA_rowmajor    = (orderA == CUSPARSE_ORDER_ROW);      // A是否行主序
