@@ -107,7 +107,13 @@ int main(void) {
         int m = 65536; // 矩阵A的行数，矩阵C的行数
         int n = 13824; // 矩阵B的列数，矩阵C的列数
         int k = 2560; // 矩阵A的列数，矩阵B的行数
-            
+
+        /*
+        int m = dim;
+        int n = dim;
+        int k = dim;
+        */
+        
         std::cout << "正在测试矩阵维度: " << m << "x" << n << "x" << k << std::endl;
         
         // 检查GPU内存状况
@@ -121,15 +127,15 @@ int main(void) {
         //CUSPARSE_ORDER_COL; CUSPARSE_ORDER_ROW;
         //CUSPARSE_OPERATION_TRANSPOSE; CUSPARSE_OPERATION_NON_TRANSPOSE;        
         auto     orderA          = CUSPARSE_ORDER_ROW;              // A 主序存储
-        auto     orderB          = CUSPARSE_ORDER_ROW;              // B 主序存储
+        auto     orderB          = CUSPARSE_ORDER_COL;              // B 主序存储
         auto     orderC          = CUSPARSE_ORDER_COL;              // C 主序存储
-        auto     opA            = CUSPARSE_OPERATION_NON_TRANSPOSE;     // A 矩阵操作
+        auto     opA            = CUSPARSE_OPERATION_TRANSPOSE;     // A 矩阵操作
         auto     opB            = CUSPARSE_OPERATION_TRANSPOSE;     // B 矩阵操作
         auto     type_AB        = cuda_type<AB_t>::value;       // A, B 矩阵的 CUDA 数据类型
         auto     type_C         = cuda_type<C_t>::value;        // C 矩阵的 CUDA 数据类型
         auto     compute_type   = cusparse_compute_type<COMPUTE_t>::value; // 计算精度
         bool     matmul_search  = true;                         // 是否启用算法搜索优化
-        int      search_iter    = 20;                            // 自定义搜索迭代次数（0 表示默认）
+        int      search_iter    = 0;                            // 自定义搜索迭代次数（0 表示默认）
         int      alg_id         = -1;                           // 指定算法ID（-1 表示自动搜索）
         
         // 根据转置操作计算实际的矩阵布局
@@ -357,6 +363,9 @@ int main(void) {
 
             int tuned_alg_id = -1;
             int alg_space    = 0;
+            int split_k      = 0;
+            int split_k_mode = 0;
+            int split_k_buffers = 0;
             CHECK_CUSPARSE( cusparseLtMatmulAlgGetAttribute(
                                                 &handle, &alg_sel,
                                                 CUSPARSELT_MATMUL_ALG_CONFIG_ID,
@@ -367,8 +376,26 @@ int main(void) {
                                                 CUSPARSELT_MATMUL_ALG_CONFIG_MAX_ID,
                                                 &alg_space,
                                                 sizeof(alg_space)) )
+            CHECK_CUSPARSE( cusparseLtMatmulAlgGetAttribute(
+                                                &handle, &alg_sel,
+                                                CUSPARSELT_MATMUL_SPLIT_K,
+                                                &split_k,
+                                                sizeof(split_k)) )
+            CHECK_CUSPARSE( cusparseLtMatmulAlgGetAttribute(
+                                                &handle, &alg_sel,
+                                                CUSPARSELT_MATMUL_SPLIT_K_MODE,
+                                                &split_k_mode,
+                                                sizeof(split_k_mode)) )
+            CHECK_CUSPARSE( cusparseLtMatmulAlgGetAttribute(
+                                                &handle, &alg_sel,
+                                                CUSPARSELT_MATMUL_SPLIT_K_BUFFERS,
+                                                &split_k_buffers,
+                                                sizeof(split_k_buffers)) )
             std::cout << "自动调优选择的算法ID: " << tuned_alg_id << std::endl;
             std::cout << "可用算法总数: " << alg_space << std::endl;
+            std::cout << "split_k=" << split_k
+                      << " split_k_mode=" << split_k_mode
+                      << " split_k_buffers=" << split_k_buffers << std::endl;
             
             // 重置 dC，因为搜索过程中 dC 的值已被修改
             // 为了后续的正确性检查，需要恢复原始值
@@ -436,7 +463,7 @@ int main(void) {
         double throughput = ops / (avg_time / 1000.0) / 1e12;
         
         // 输出当前维度的测试结果
-        std::cout << "维度: " << dim << "x" << dim << "x" << dim
+        std::cout << "维度: " << m << "x" << n << "x" << k
                   << ", 平均耗时: " << avg_time << " 毫秒"
                   << ", 吞吐量(50%稀疏): " << throughput << " TOPS" << std::endl;
 
