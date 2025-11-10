@@ -90,7 +90,7 @@ struct cusparse_compute_type<int> {
 int main(void) {
 
     //std::vector<int> dimensions = {512, 1024, 2048, 4096, 8192, 12288, 16384};
-    std::vector<int> dimensions = {512};
+    std::vector<int> dimensions = {1024};
 
     // 每个维度下重复执行的次数，用于获取稳定的性能数据
     const int num_runs = 10;
@@ -104,9 +104,9 @@ int main(void) {
     // 遍历所有测试维度，分别进行测试
     for (int dim : dimensions) {
         // 65536; 13824; 6912; 5120; 3840; 2560
-        int m = 512; // 矩阵A的行数，矩阵C的行数
-        int n = 512; // 矩阵B的列数，矩阵C的列数
-        int k = 512; // 矩阵A的列数，矩阵B的行数
+        int m = 65536; // 矩阵A的行数，矩阵C的行数
+        int n = 13824; // 矩阵B的列数，矩阵C的列数
+        int k = 2560; // 矩阵A的列数，矩阵B的行数
 
         /*
         int m = dim;
@@ -131,6 +131,7 @@ int main(void) {
         auto     orderC          = CUSPARSE_ORDER_COL;              // C 主序存储
         auto     opA            = CUSPARSE_OPERATION_NON_TRANSPOSE;     // A 矩阵操作
         auto     opB            = CUSPARSE_OPERATION_TRANSPOSE;     // B 矩阵操作
+        
         auto     type_AB        = cuda_type<AB_t>::value;       // A, B 矩阵的 CUDA 数据类型
         auto     type_C         = cuda_type<C_t>::value;        // C 矩阵的 CUDA 数据类型
         auto     compute_type   = cusparse_compute_type<COMPUTE_t>::value; // 计算精度
