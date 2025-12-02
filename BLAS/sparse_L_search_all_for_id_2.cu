@@ -1,6 +1,6 @@
 // 稀疏在左：自动遍历所有算法ID并记录性能
-// $ nvcc -o sparse_L_search_all_for_id_6 sparse_L_search_all_for_id_6.cu -lcusparseLt && ./sparse_L_search_all_for_id_6
-const char* kCsvFileName = "L_NT_RR_R_id_6.csv"; // 可修改的结果文件名
+// $ nvcc -o sparse_L_search_all_for_id_2 sparse_L_search_all_for_id_2.cu -lcusparseLt && ./sparse_L_search_all_for_id_2
+const char* kCsvFileName = "L_NT_RR_C_id_2.csv"; // 可修改的结果文件名
 
 #include <cuda_runtime_api.h>
 #include <cusparseLt.h>
@@ -105,7 +105,7 @@ int main() {
 			//CUSPARSE_OPERATION_NON_TRANSPOSE; CUSPARSE_OPERATION_TRANSPOSE
 			auto orderA        = CUSPARSE_ORDER_ROW;
 			auto orderB        = CUSPARSE_ORDER_ROW;
-			auto orderC        = CUSPARSE_ORDER_ROW;
+			auto orderC        = CUSPARSE_ORDER_COL;
 			auto opA           = CUSPARSE_OPERATION_NON_TRANSPOSE;
 			auto opB           = CUSPARSE_OPERATION_TRANSPOSE;
 			auto type_AB       = cuda_type<AB_t>::value;
@@ -253,9 +253,9 @@ int main() {
 			double best_throughput = -1.0;
 			float best_time = 0.0f;
 			int best_alg = -1;
-			double id6_throughput = -1.0;
-			float id6_time = 0.0f;
-			bool id6_valid = false;
+			double id2_throughput = -1.0;
+			float id2_time = 0.0f;
+			bool id2_valid = false;
 
 			for (int alg_id = 0; alg_id <= max_alg_id; ++alg_id) {
 				AB_t *dA_compressed_local = nullptr;
@@ -487,10 +487,10 @@ int main() {
 						best_alg = alg_id;
 					}
 
-					if (alg_id == 6) {
-						id6_throughput = throughput;
-						id6_time = avg_time;
-						id6_valid = true;
+					if (alg_id == 2) {
+						id2_throughput = throughput;
+						id2_time = avg_time;
+						id2_valid = true;
 					}
 				}
 
@@ -511,11 +511,11 @@ int main() {
 					  << " 没有获得任何有效算法结果。" << std::endl;
 			}
 
-			if (id6_valid) {
-				std::cout << "ID=6 算法吞吐: " << id6_throughput
-					  << " TOPS (耗时 " << id6_time << " ms)" << std::endl;
+			if (id2_valid) {
+				std::cout << "ID=2 算法吞吐: " << id2_throughput
+					  << " TOPS (耗时 " << id2_time << " ms)" << std::endl;
 			} else {
-				std::cout << "ID=6 算法未获得有效结果。" << std::endl;
+				std::cout << "ID=2 算法未获得有效结果。" << std::endl;
 			}
 
 			std::ostringstream summary;
@@ -525,8 +525,8 @@ int main() {
 			} else {
 				summary << "None," << 0.0 << ',';
 			}
-			summary << (id6_valid ? id6_throughput : 0.0) << ','
-					 << (id6_valid ? id6_time : 0.0f);
+			summary << (id2_valid ? id2_throughput : 0.0) << ','
+					 << (id2_valid ? id2_time : 0.0f);
 			summary_rows.push_back(summary.str());
 			csv << '\n';
 
@@ -543,7 +543,7 @@ int main() {
 	}
 
 	if (!summary_rows.empty()) {
-		csv << "SummaryM,SummaryN,SummaryK,BestID,BestTOPS,ID6TOPS,ID6TimeMs\n";
+		csv << "SummaryM,SummaryN,SummaryK,BestID,BestTOPS,ID2TOPS,ID2TimeMs\n";
 		for (const auto &row : summary_rows) {
 			csv << row << '\n';
 		}

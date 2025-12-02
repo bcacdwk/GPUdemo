@@ -57,7 +57,7 @@ cublasComputeType_t computeType = CUBLAS_COMPUTE_16F;
 int main() {
     std::srand(static_cast<unsigned>(time(nullptr)));
 
-    std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
+    std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192};
     std::vector<std::pair<int, int>> nk_pairs = {
         {2560, 2560},
         {3840, 2560},
@@ -143,7 +143,7 @@ int main() {
                                       Ctype,
                                       m,
                                       computeType,
-                                      CUBLAS_GEMM_DEFAULT));
+                                      CUBLAS_GEMM_AUTOTUNE));
 
             float total_time = 0.0f;
             for (int run = 0; run < num_runs; ++run) {
@@ -169,7 +169,7 @@ int main() {
                                           Ctype,
                                           m,
                                           computeType,
-                                          CUBLAS_GEMM_DEFAULT));
+                                          CUBLAS_GEMM_AUTOTUNE));
 
                 CHECK_CUDA(cudaEventRecord(stop));
                 CHECK_CUDA(cudaEventSynchronize(stop));
