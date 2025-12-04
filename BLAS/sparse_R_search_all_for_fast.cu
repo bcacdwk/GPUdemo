@@ -65,7 +65,7 @@ struct cusparse_compute_type<int> {
 int main() {
 	std::srand(static_cast<unsigned>(time(nullptr)));
 
-	std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192};
+    std::vector<int> m_values = {256, 320, 384, 448, 512, 1024, 2048, 4096, 8192};
 	//std::vector<int> m_values = {16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256};
 
 	std::vector<std::pair<int, int>> nk_pairs = {
