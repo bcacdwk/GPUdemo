@@ -1,6 +1,6 @@
 // 稀疏在左：自动遍历所有算法ID并记录性能
 // $ nvcc -o sparse_L_search_all sparse_L_search_all.cu -lcusparseLt && ./sparse_L_search_all
-const char* kCsvFileName = "L_TN_CC_C.csv"; // 可修改的结果文件名
+const char* kCsvFileName = "L_NT_RR_R_small_M.csv"; // 可修改的结果文件名
 
 #include <cuda_runtime_api.h>
 #include <cusparseLt.h>
@@ -65,8 +65,8 @@ struct cusparse_compute_type<int> {
 int main() {
 	std::srand(static_cast<unsigned>(time(nullptr)));
 
-	std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
-	//std::vector<int> m_values = {256, 512};
+	//std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
+	std::vector<int> m_values = {32, 64, 96, 128, 160, 192, 224, 256};
 
 	std::vector<std::pair<int, int>> nk_pairs = {
 		{2560, 2560},
@@ -103,11 +103,11 @@ int main() {
 					  << " MB, 总计 " << total_mem / (1024 * 1024) << " MB" << std::endl;
 			//CUSPARSE_ORDER_ROW; CUSPARSE_ORDER_COL
 			//CUSPARSE_OPERATION_NON_TRANSPOSE; CUSPARSE_OPERATION_TRANSPOSE
-			auto orderA        = CUSPARSE_ORDER_COL;
-			auto orderB        = CUSPARSE_ORDER_COL;
-			auto orderC        = CUSPARSE_ORDER_COL;
-			auto opA           = CUSPARSE_OPERATION_TRANSPOSE;
-			auto opB           = CUSPARSE_OPERATION_NON_TRANSPOSE;
+			auto orderA        = CUSPARSE_ORDER_ROW;
+			auto orderB        = CUSPARSE_ORDER_ROW;
+			auto orderC        = CUSPARSE_ORDER_ROW;
+			auto opA           = CUSPARSE_OPERATION_NON_TRANSPOSE;
+			auto opB           = CUSPARSE_OPERATION_TRANSPOSE;
 			auto type_AB       = cuda_type<AB_t>::value;
 			auto type_C        = cuda_type<C_t>::value;
 			auto compute_type  = cusparse_compute_type<COMPUTE_t>::value;
