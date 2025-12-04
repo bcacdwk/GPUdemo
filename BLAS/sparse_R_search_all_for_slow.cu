@@ -1,6 +1,6 @@
-// 稀疏在左：自动遍历所有算法ID并记录性能
-// $ nvcc -o sparse_L_search_all_for_id_2 sparse_L_search_all_for_id_2.cu -lcusparseLt && ./sparse_L_search_all_for_id_2
-const char* kCsvFileName = "L_NT_RR_C_id_2.csv"; // 可修改的结果文件名
+// 稀疏在右：自动遍历所有算法ID并记录性能
+// $ nvcc -o sparse_R_search_all_for_slow sparse_R_search_all_for_slow.cu -lcusparseLt && ./sparse_R_search_all_for_slow
+const char* kCsvFileName = "R_NT_RR_R_slow.csv"; // 可修改的结果文件名
 
 #include <cuda_runtime_api.h>
 #include <cusparseLt.h>
@@ -66,7 +66,7 @@ int main() {
 	std::srand(static_cast<unsigned>(time(nullptr)));
 
 	std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192};
-	//std::vector<int> m_values = {256, 512};
+	//std::vector<int> m_values = {16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256};
 
 	std::vector<std::pair<int, int>> nk_pairs = {
 		{2560, 2560},
@@ -105,7 +105,7 @@ int main() {
 			//CUSPARSE_OPERATION_NON_TRANSPOSE; CUSPARSE_OPERATION_TRANSPOSE
 			auto orderA        = CUSPARSE_ORDER_ROW;
 			auto orderB        = CUSPARSE_ORDER_ROW;
-			auto orderC        = CUSPARSE_ORDER_COL;
+			auto orderC        = CUSPARSE_ORDER_ROW;
 			auto opA           = CUSPARSE_OPERATION_NON_TRANSPOSE;
 			auto opB           = CUSPARSE_OPERATION_TRANSPOSE;
 			auto type_AB       = cuda_type<AB_t>::value;
@@ -178,15 +178,15 @@ int main() {
 
 			CHECK_CUSPARSE(cusparseLtInit(&handle));
 
-			CHECK_CUSPARSE(cusparseLtStructuredDescriptorInit(&handle, &matA,
-															   num_A_rows, num_A_cols,
-															   lda, alignment, type_AB,
-															   orderA, CUSPARSELT_SPARSITY_50_PERCENT));
+			CHECK_CUSPARSE(cusparseLtDenseDescriptorInit(&handle, &matA,
+						  num_A_rows, num_A_cols,
+						  lda, alignment, type_AB,
+						  orderA));
 
-			CHECK_CUSPARSE(cusparseLtDenseDescriptorInit(&handle, &matB,
-														  num_B_rows, num_B_cols,
-														  ldb, alignment, type_AB,
-														  orderB));
+			CHECK_CUSPARSE(cusparseLtStructuredDescriptorInit(&handle, &matB,
+						   num_B_rows, num_B_cols,
+						   ldb, alignment, type_AB,
+						   orderB, CUSPARSELT_SPARSITY_50_PERCENT));
 
 			CHECK_CUSPARSE(cusparseLtDenseDescriptorInit(&handle, &matC,
 														  num_C_rows, num_C_cols,
@@ -198,13 +198,13 @@ int main() {
 														   &matC, &matC, compute_type));
 
 			CHECK_CUSPARSE(cusparseLtMatmulDescSetAttribute(&handle, &matmul,
-															 CUSPARSELT_MATMUL_SPARSE_MAT_POINTER,
-															 &dA, sizeof(dA)));
+						 CUSPARSELT_MATMUL_SPARSE_MAT_POINTER,
+						 &dB, sizeof(dB)));
 
-			CHECK_CUSPARSE(cusparseLtSpMMAPrune(&handle, &matmul, dA, dA,
+			CHECK_CUSPARSE(cusparseLtSpMMAPrune(&handle, &matmul, dB, dB,
 												CUSPARSELT_PRUNE_SPMMA_TILE, stream));
 
-			CHECK_CUSPARSE(cusparseLtSpMMAPruneCheck(&handle, &matmul, dA,
+			CHECK_CUSPARSE(cusparseLtSpMMAPruneCheck(&handle, &matmul, dB,
 									  d_valid, stream));
 
 			int is_valid = 0;
@@ -258,8 +258,8 @@ int main() {
 			bool id2_valid = false;
 
 			for (int alg_id = 0; alg_id <= max_alg_id; ++alg_id) {
-				AB_t *dA_compressed_local = nullptr;
-				void *dA_compressedBuffer_local = nullptr;
+				AB_t *dB_compressed_local = nullptr;
+				void *dB_compressedBuffer_local = nullptr;
 				void *d_workspace_local = nullptr;
 				bool record_valid = true;
 				bool selection_created = false;
@@ -282,13 +282,13 @@ int main() {
 						cudaFree(d_workspace_local);
 						d_workspace_local = nullptr;
 					}
-					if (dA_compressedBuffer_local) {
-						cudaFree(dA_compressedBuffer_local);
-						dA_compressedBuffer_local = nullptr;
+					if (dB_compressedBuffer_local) {
+						cudaFree(dB_compressedBuffer_local);
+						dB_compressedBuffer_local = nullptr;
 					}
-					if (dA_compressed_local) {
-						cudaFree(dA_compressed_local);
-						dA_compressed_local = nullptr;
+					if (dB_compressed_local) {
+						cudaFree(dB_compressed_local);
+						dB_compressed_local = nullptr;
 					}
 					if (plan_created) {
 						cusparseLtMatmulPlanDestroy(&plan);
@@ -335,7 +335,7 @@ int main() {
 					continue;
 				}
 
-				cudaError_t cuda_status = cudaMalloc(reinterpret_cast<void **>(&dA_compressed_local), compressed_size);
+				cudaError_t cuda_status = cudaMalloc(reinterpret_cast<void **>(&dB_compressed_local), compressed_size);
 				if (cuda_status != cudaSuccess) {
 					std::cout << "算法ID " << alg_id << " 分配压缩矩阵失败: "
 						  << cudaGetErrorString(cuda_status) << std::endl;
@@ -345,7 +345,7 @@ int main() {
 				}
 
 				if (compressed_buffer_size > 0) {
-					cuda_status = cudaMalloc(&dA_compressedBuffer_local, compressed_buffer_size);
+					cuda_status = cudaMalloc(&dB_compressedBuffer_local, compressed_buffer_size);
 					if (cuda_status != cudaSuccess) {
 						std::cout << "算法ID " << alg_id << " 分配压缩缓冲区失败: "
 							  << cudaGetErrorString(cuda_status) << std::endl;
@@ -356,8 +356,8 @@ int main() {
 				}
 
 				cusparseStatus_t compress_status = cusparseLtSpMMACompress(
-					&handle, &plan, dA, dA_compressed_local,
-					dA_compressedBuffer_local, stream);
+					&handle, &plan, dB, dB_compressed_local,
+					dB_compressedBuffer_local, stream);
 				if (compress_status != CUSPARSE_STATUS_SUCCESS) {
 					std::cout << "算法ID " << alg_id << " 的稀疏矩阵压缩失败: "
 						  << cusparseLtGetErrorString(compress_status) << std::endl;
@@ -398,7 +398,7 @@ int main() {
 				}
 
 				cusparseStatus_t warmup_status = cusparseLtMatmul(
-					&handle, &plan, &alpha, dA_compressed_local, dB,
+					&handle, &plan, &alpha, dA, dB_compressed_local,
 					&beta, dC, dD, d_workspace_local, nullptr, 0);
 				if (warmup_status != CUSPARSE_STATUS_SUCCESS) {
 					std::cout << "算法ID " << alg_id << " 预热计算失败: "
@@ -429,7 +429,7 @@ int main() {
 					}
 
 					cusparseStatus_t compute_status = cusparseLtMatmul(
-						&handle, &plan, &alpha, dA_compressed_local, dB,
+						&handle, &plan, &alpha, dA, dB_compressed_local,
 						&beta, dC, dD, d_workspace_local, nullptr, 0);
 					if (compute_status != CUSPARSE_STATUS_SUCCESS) {
 						std::cout << "算法ID " << alg_id << " 第 " << run

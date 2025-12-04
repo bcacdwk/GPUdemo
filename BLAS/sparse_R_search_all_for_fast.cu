@@ -1,6 +1,6 @@
 // 稀疏在右：自动遍历所有算法ID并记录性能
-// $ nvcc -o sparse_R_search_all sparse_R_search_all.cu -lcusparseLt && ./sparse_R_search_all
-const char* kCsvFileName = "R_NT_RR_C_small_M.csv"; // 可修改的结果文件名
+// $ nvcc -o sparse_R_search_all_for_fast sparse_R_search_all_for_fast.cu -lcusparseLt && ./sparse_R_search_all_for_fast
+const char* kCsvFileName = "R_NT_RR_C_fast.csv"; // 可修改的结果文件名
 
 #include <cuda_runtime_api.h>
 #include <cusparseLt.h>
@@ -65,8 +65,8 @@ struct cusparse_compute_type<int> {
 int main() {
 	std::srand(static_cast<unsigned>(time(nullptr)));
 
-	//std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
-	std::vector<int> m_values = {16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256};
+	std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192};
+	//std::vector<int> m_values = {16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256};
 
 	std::vector<std::pair<int, int>> nk_pairs = {
 		{2560, 2560},
@@ -250,13 +250,12 @@ int main() {
 				continue;
 			}
 
-			double best_throughput_1 = -1.0;
-			double best_throughput_2 = -1.0;
-			float best_time_1 = 0.0f;
-			float best_time_2 = 0.0f;
-			int best_alg_1 = -1;
-			int best_alg_2 = -1;
-			double throughput_alg_6 = 0.0;
+			double best_throughput = -1.0;
+			float best_time = 0.0f;
+			int best_alg = -1;
+			double id6_throughput = -1.0;
+			float id6_time = 0.0f;
+			bool id6_valid = false;
 
 			for (int alg_id = 0; alg_id <= max_alg_id; ++alg_id) {
 				AB_t *dB_compressed_local = nullptr;
@@ -482,20 +481,16 @@ int main() {
 					std::cout << "算法ID " << alg_id << " 平均耗时: " << avg_time
 						  << " ms, 吞吐量: " << throughput << " TOPS" << std::endl;
 
-					if (alg_id == 6) throughput_alg_6 = throughput;
+					if (throughput > best_throughput) {
+						best_throughput = throughput;
+						best_time = avg_time;
+						best_alg = alg_id;
+					}
 
-					if (throughput > best_throughput_1) {
-						best_throughput_2 = best_throughput_1;
-						best_time_2 = best_time_1;
-						best_alg_2 = best_alg_1;
-
-						best_throughput_1 = throughput;
-						best_time_1 = avg_time;
-						best_alg_1 = alg_id;
-					} else if (throughput > best_throughput_2) {
-						best_throughput_2 = throughput;
-						best_time_2 = avg_time;
-						best_alg_2 = alg_id;
+					if (alg_id == 6) {
+						id6_throughput = throughput;
+						id6_time = avg_time;
+						id6_valid = true;
 					}
 				}
 
@@ -506,37 +501,32 @@ int main() {
 				}
 			}
 
-			if (best_alg_1 >= 0) {
+			if (best_alg >= 0) {
 				std::cout << "组合 M=" << m << ", N=" << n << ", K=" << k
-					  << " 最快算法ID: " << best_alg_1
-					  << " (耗时 " << best_time_1 << " ms, 吞吐 "
-					  << best_throughput_1 << " TOPS)" << std::endl;
-				if (best_alg_2 >= 0) {
-					std::cout << "次快算法ID: " << best_alg_2
-						  << " (耗时 " << best_time_2 << " ms, 吞吐 "
-						  << best_throughput_2 << " TOPS)" << std::endl;
-				} else {
-					std::cout << "未找到次快算法，只有一个有效算法结果。" << std::endl;
-				}
+					  << " 最快算法ID: " << best_alg
+					  << " (耗时 " << best_time << " ms, 吞吐 "
+					  << best_throughput << " TOPS)" << std::endl;
 			} else {
 				std::cout << "组合 M=" << m << ", N=" << n << ", K=" << k
 					  << " 没有获得任何有效算法结果。" << std::endl;
 			}
 
-			std::ostringstream summary;
-			summary << m << ',' << n << ',' << k << ",BestID=";
-			if (best_alg_1 >= 0) {
-				summary << best_alg_1 << ";SecondID=";
-				if (best_alg_2 >= 0) {
-					summary << best_alg_2;
-				} else {
-					summary << "None";
-				}
-				summary << ',' << best_throughput_1 << ',';
-				summary << ((best_alg_2 >= 0) ? best_throughput_2 : 0.0) << ',' << throughput_alg_6;
+			if (id6_valid) {
+				std::cout << "ID=6 算法吞吐: " << id6_throughput
+					  << " TOPS (耗时 " << id6_time << " ms)" << std::endl;
 			} else {
-				summary << "None;SecondID=None," << 0.0 << ',' << 0.0 << ',' << 0.0;
+				std::cout << "ID=6 算法未获得有效结果。" << std::endl;
 			}
+
+			std::ostringstream summary;
+			summary << m << ',' << n << ',' << k << ',';
+			if (best_alg >= 0) {
+				summary << best_alg << ',' << best_throughput << ',';
+			} else {
+				summary << "None," << 0.0 << ',';
+			}
+			summary << (id6_valid ? id6_throughput : 0.0) << ','
+					 << (id6_valid ? id6_time : 0.0f);
 			summary_rows.push_back(summary.str());
 			csv << '\n';
 
@@ -553,7 +543,7 @@ int main() {
 	}
 
 	if (!summary_rows.empty()) {
-		csv << "SummaryM,SummaryN,SummaryK,SummaryIDs,BestTOPS,SecondTOPS,Alg6TOPS\n";
+		csv << "SummaryM,SummaryN,SummaryK,BestID,BestTOPS,ID6TOPS,ID6TimeMs\n";
 		for (const auto &row : summary_rows) {
 			csv << row << '\n';
 		}

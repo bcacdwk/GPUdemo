@@ -66,7 +66,7 @@ int main() {
 	std::srand(static_cast<unsigned>(time(nullptr)));
 
 	//std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
-	std::vector<int> m_values = {16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256};
+	std::vector<int> m_values = {32, 64, 96, 128, 160, 192, 224, 256};
 
 	std::vector<std::pair<int, int>> nk_pairs = {
 		{2560, 2560},
@@ -256,6 +256,7 @@ int main() {
 			float best_time_2 = 0.0f;
 			int best_alg_1 = -1;
 			int best_alg_2 = -1;
+			double throughput_alg_6 = 0.0;
 
 			for (int alg_id = 0; alg_id <= max_alg_id; ++alg_id) {
 				AB_t *dA_compressed_local = nullptr;
@@ -481,6 +482,8 @@ int main() {
 					std::cout << "算法ID " << alg_id << " 平均耗时: " << avg_time
 						  << " ms, 吞吐量: " << throughput << " TOPS" << std::endl;
 
+					if (alg_id == 6) throughput_alg_6 = throughput;
+
 					if (throughput > best_throughput_1) {
 						best_throughput_2 = best_throughput_1;
 						best_time_2 = best_time_1;
@@ -530,9 +533,9 @@ int main() {
 					summary << "None";
 				}
 				summary << ',' << best_throughput_1 << ',';
-				summary << ((best_alg_2 >= 0) ? best_throughput_2 : 0.0);
+				summary << ((best_alg_2 >= 0) ? best_throughput_2 : 0.0) << ',' << throughput_alg_6;
 			} else {
-				summary << "None;SecondID=None," << 0.0 << ',' << 0.0;
+				summary << "None;SecondID=None," << 0.0 << ',' << 0.0 << ',' << 0.0;
 			}
 			summary_rows.push_back(summary.str());
 			csv << '\n';
@@ -550,7 +553,7 @@ int main() {
 	}
 
 	if (!summary_rows.empty()) {
-		csv << "SummaryM,SummaryN,SummaryK,SummaryIDs,BestTOPS,SecondTOPS\n";
+		csv << "SummaryM,SummaryN,SummaryK,SummaryIDs,BestTOPS,SecondTOPS,Alg6TOPS\n";
 		for (const auto &row : summary_rows) {
 			csv << row << '\n';
 		}

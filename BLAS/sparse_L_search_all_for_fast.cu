@@ -1,6 +1,6 @@
-// 稀疏在右：自动遍历所有算法ID并记录性能
-// $ nvcc -o sparse_R_search_all sparse_R_search_all.cu -lcusparseLt && ./sparse_R_search_all
-const char* kCsvFileName = "R_NT_RR_C_small_M.csv"; // 可修改的结果文件名
+// 稀疏在左：自动遍历所有算法ID并记录性能
+// $ nvcc -o sparse_L_search_all_for_fast sparse_L_search_all_for_fast.cu -lcusparseLt && ./sparse_L_search_all_for_fast
+const char* kCsvFileName = "L_NT_RR_R_fast.csv"; // 可修改的结果文件名
 
 #include <cuda_runtime_api.h>
 #include <cusparseLt.h>
@@ -65,8 +65,8 @@ struct cusparse_compute_type<int> {
 int main() {
 	std::srand(static_cast<unsigned>(time(nullptr)));
 
-	//std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
-	std::vector<int> m_values = {16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256};
+	std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192};
+	//std::vector<int> m_values = {32, 64, 96, 128};
 
 	std::vector<std::pair<int, int>> nk_pairs = {
 		{2560, 2560},
@@ -105,7 +105,7 @@ int main() {
 			//CUSPARSE_OPERATION_NON_TRANSPOSE; CUSPARSE_OPERATION_TRANSPOSE
 			auto orderA        = CUSPARSE_ORDER_ROW;
 			auto orderB        = CUSPARSE_ORDER_ROW;
-			auto orderC        = CUSPARSE_ORDER_COL;
+			auto orderC        = CUSPARSE_ORDER_ROW;
 			auto opA           = CUSPARSE_OPERATION_NON_TRANSPOSE;
 			auto opB           = CUSPARSE_OPERATION_TRANSPOSE;
 			auto type_AB       = cuda_type<AB_t>::value;
@@ -178,15 +178,15 @@ int main() {
 
 			CHECK_CUSPARSE(cusparseLtInit(&handle));
 
-			CHECK_CUSPARSE(cusparseLtDenseDescriptorInit(&handle, &matA,
-						  num_A_rows, num_A_cols,
-						  lda, alignment, type_AB,
-						  orderA));
+			CHECK_CUSPARSE(cusparseLtStructuredDescriptorInit(&handle, &matA,
+															   num_A_rows, num_A_cols,
+															   lda, alignment, type_AB,
+															   orderA, CUSPARSELT_SPARSITY_50_PERCENT));
 
-			CHECK_CUSPARSE(cusparseLtStructuredDescriptorInit(&handle, &matB,
-						   num_B_rows, num_B_cols,
-						   ldb, alignment, type_AB,
-						   orderB, CUSPARSELT_SPARSITY_50_PERCENT));
+			CHECK_CUSPARSE(cusparseLtDenseDescriptorInit(&handle, &matB,
+														  num_B_rows, num_B_cols,
+														  ldb, alignment, type_AB,
+														  orderB));
 
 			CHECK_CUSPARSE(cusparseLtDenseDescriptorInit(&handle, &matC,
 														  num_C_rows, num_C_cols,
@@ -198,13 +198,13 @@ int main() {
 														   &matC, &matC, compute_type));
 
 			CHECK_CUSPARSE(cusparseLtMatmulDescSetAttribute(&handle, &matmul,
-						 CUSPARSELT_MATMUL_SPARSE_MAT_POINTER,
-						 &dB, sizeof(dB)));
+															 CUSPARSELT_MATMUL_SPARSE_MAT_POINTER,
+															 &dA, sizeof(dA)));
 
-			CHECK_CUSPARSE(cusparseLtSpMMAPrune(&handle, &matmul, dB, dB,
+			CHECK_CUSPARSE(cusparseLtSpMMAPrune(&handle, &matmul, dA, dA,
 												CUSPARSELT_PRUNE_SPMMA_TILE, stream));
 
-			CHECK_CUSPARSE(cusparseLtSpMMAPruneCheck(&handle, &matmul, dB,
+			CHECK_CUSPARSE(cusparseLtSpMMAPruneCheck(&handle, &matmul, dA,
 									  d_valid, stream));
 
 			int is_valid = 0;
@@ -250,17 +250,16 @@ int main() {
 				continue;
 			}
 
-			double best_throughput_1 = -1.0;
-			double best_throughput_2 = -1.0;
-			float best_time_1 = 0.0f;
-			float best_time_2 = 0.0f;
-			int best_alg_1 = -1;
-			int best_alg_2 = -1;
-			double throughput_alg_6 = 0.0;
+			double best_throughput = -1.0;
+			float best_time = 0.0f;
+			int best_alg = -1;
+			double id6_throughput = -1.0;
+			float id6_time = 0.0f;
+			bool id6_valid = false;
 
 			for (int alg_id = 0; alg_id <= max_alg_id; ++alg_id) {
-				AB_t *dB_compressed_local = nullptr;
-				void *dB_compressedBuffer_local = nullptr;
+				AB_t *dA_compressed_local = nullptr;
+				void *dA_compressedBuffer_local = nullptr;
 				void *d_workspace_local = nullptr;
 				bool record_valid = true;
 				bool selection_created = false;
@@ -283,13 +282,13 @@ int main() {
 						cudaFree(d_workspace_local);
 						d_workspace_local = nullptr;
 					}
-					if (dB_compressedBuffer_local) {
-						cudaFree(dB_compressedBuffer_local);
-						dB_compressedBuffer_local = nullptr;
+					if (dA_compressedBuffer_local) {
+						cudaFree(dA_compressedBuffer_local);
+						dA_compressedBuffer_local = nullptr;
 					}
-					if (dB_compressed_local) {
-						cudaFree(dB_compressed_local);
-						dB_compressed_local = nullptr;
+					if (dA_compressed_local) {
+						cudaFree(dA_compressed_local);
+						dA_compressed_local = nullptr;
 					}
 					if (plan_created) {
 						cusparseLtMatmulPlanDestroy(&plan);
@@ -336,7 +335,7 @@ int main() {
 					continue;
 				}
 
-				cudaError_t cuda_status = cudaMalloc(reinterpret_cast<void **>(&dB_compressed_local), compressed_size);
+				cudaError_t cuda_status = cudaMalloc(reinterpret_cast<void **>(&dA_compressed_local), compressed_size);
 				if (cuda_status != cudaSuccess) {
 					std::cout << "算法ID " << alg_id << " 分配压缩矩阵失败: "
 						  << cudaGetErrorString(cuda_status) << std::endl;
@@ -346,7 +345,7 @@ int main() {
 				}
 
 				if (compressed_buffer_size > 0) {
-					cuda_status = cudaMalloc(&dB_compressedBuffer_local, compressed_buffer_size);
+					cuda_status = cudaMalloc(&dA_compressedBuffer_local, compressed_buffer_size);
 					if (cuda_status != cudaSuccess) {
 						std::cout << "算法ID " << alg_id << " 分配压缩缓冲区失败: "
 							  << cudaGetErrorString(cuda_status) << std::endl;
@@ -357,8 +356,8 @@ int main() {
 				}
 
 				cusparseStatus_t compress_status = cusparseLtSpMMACompress(
-					&handle, &plan, dB, dB_compressed_local,
-					dB_compressedBuffer_local, stream);
+					&handle, &plan, dA, dA_compressed_local,
+					dA_compressedBuffer_local, stream);
 				if (compress_status != CUSPARSE_STATUS_SUCCESS) {
 					std::cout << "算法ID " << alg_id << " 的稀疏矩阵压缩失败: "
 						  << cusparseLtGetErrorString(compress_status) << std::endl;
@@ -399,7 +398,7 @@ int main() {
 				}
 
 				cusparseStatus_t warmup_status = cusparseLtMatmul(
-					&handle, &plan, &alpha, dA, dB_compressed_local,
+					&handle, &plan, &alpha, dA_compressed_local, dB,
 					&beta, dC, dD, d_workspace_local, nullptr, 0);
 				if (warmup_status != CUSPARSE_STATUS_SUCCESS) {
 					std::cout << "算法ID " << alg_id << " 预热计算失败: "
@@ -430,7 +429,7 @@ int main() {
 					}
 
 					cusparseStatus_t compute_status = cusparseLtMatmul(
-						&handle, &plan, &alpha, dA, dB_compressed_local,
+						&handle, &plan, &alpha, dA_compressed_local, dB,
 						&beta, dC, dD, d_workspace_local, nullptr, 0);
 					if (compute_status != CUSPARSE_STATUS_SUCCESS) {
 						std::cout << "算法ID " << alg_id << " 第 " << run
@@ -482,20 +481,16 @@ int main() {
 					std::cout << "算法ID " << alg_id << " 平均耗时: " << avg_time
 						  << " ms, 吞吐量: " << throughput << " TOPS" << std::endl;
 
-					if (alg_id == 6) throughput_alg_6 = throughput;
+					if (throughput > best_throughput) {
+						best_throughput = throughput;
+						best_time = avg_time;
+						best_alg = alg_id;
+					}
 
-					if (throughput > best_throughput_1) {
-						best_throughput_2 = best_throughput_1;
-						best_time_2 = best_time_1;
-						best_alg_2 = best_alg_1;
-
-						best_throughput_1 = throughput;
-						best_time_1 = avg_time;
-						best_alg_1 = alg_id;
-					} else if (throughput > best_throughput_2) {
-						best_throughput_2 = throughput;
-						best_time_2 = avg_time;
-						best_alg_2 = alg_id;
+					if (alg_id == 6) {
+						id6_throughput = throughput;
+						id6_time = avg_time;
+						id6_valid = true;
 					}
 				}
 
@@ -506,37 +501,32 @@ int main() {
 				}
 			}
 
-			if (best_alg_1 >= 0) {
+			if (best_alg >= 0) {
 				std::cout << "组合 M=" << m << ", N=" << n << ", K=" << k
-					  << " 最快算法ID: " << best_alg_1
-					  << " (耗时 " << best_time_1 << " ms, 吞吐 "
-					  << best_throughput_1 << " TOPS)" << std::endl;
-				if (best_alg_2 >= 0) {
-					std::cout << "次快算法ID: " << best_alg_2
-						  << " (耗时 " << best_time_2 << " ms, 吞吐 "
-						  << best_throughput_2 << " TOPS)" << std::endl;
-				} else {
-					std::cout << "未找到次快算法，只有一个有效算法结果。" << std::endl;
-				}
+					  << " 最快算法ID: " << best_alg
+					  << " (耗时 " << best_time << " ms, 吞吐 "
+					  << best_throughput << " TOPS)" << std::endl;
 			} else {
 				std::cout << "组合 M=" << m << ", N=" << n << ", K=" << k
 					  << " 没有获得任何有效算法结果。" << std::endl;
 			}
 
-			std::ostringstream summary;
-			summary << m << ',' << n << ',' << k << ",BestID=";
-			if (best_alg_1 >= 0) {
-				summary << best_alg_1 << ";SecondID=";
-				if (best_alg_2 >= 0) {
-					summary << best_alg_2;
-				} else {
-					summary << "None";
-				}
-				summary << ',' << best_throughput_1 << ',';
-				summary << ((best_alg_2 >= 0) ? best_throughput_2 : 0.0) << ',' << throughput_alg_6;
+			if (id6_valid) {
+				std::cout << "ID=6 算法吞吐: " << id6_throughput
+					  << " TOPS (耗时 " << id6_time << " ms)" << std::endl;
 			} else {
-				summary << "None;SecondID=None," << 0.0 << ',' << 0.0 << ',' << 0.0;
+				std::cout << "ID=6 算法未获得有效结果。" << std::endl;
 			}
+
+			std::ostringstream summary;
+			summary << m << ',' << n << ',' << k << ',';
+			if (best_alg >= 0) {
+				summary << best_alg << ',' << best_throughput << ',';
+			} else {
+				summary << "None," << 0.0 << ',';
+			}
+			summary << (id6_valid ? id6_throughput : 0.0) << ','
+					 << (id6_valid ? id6_time : 0.0f);
 			summary_rows.push_back(summary.str());
 			csv << '\n';
 
@@ -553,7 +543,7 @@ int main() {
 	}
 
 	if (!summary_rows.empty()) {
-		csv << "SummaryM,SummaryN,SummaryK,SummaryIDs,BestTOPS,SecondTOPS,Alg6TOPS\n";
+		csv << "SummaryM,SummaryN,SummaryK,BestID,BestTOPS,ID6TOPS,ID6TimeMs\n";
 		for (const auto &row : summary_rows) {
 			csv << row << '\n';
 		}
