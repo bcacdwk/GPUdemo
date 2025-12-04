@@ -4,7 +4,7 @@
 // nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=nsys_cublas ./cuBLAS_search_all_int8
 
 
-const char* kCsvFileName = "cuBLAS_TN_fp16.csv"; // 可修改的结果文件名
+const char* kCsvFileName = "cuBLAS_TN_int8.csv"; // 可修改的结果文件名
 
 #include <cublas_v2.h>
 #include <cuda_runtime_api.h>
@@ -57,8 +57,8 @@ cublasComputeType_t computeType = CUBLAS_COMPUTE_16F;
 int main() {
     std::srand(static_cast<unsigned>(time(nullptr)));
 
-    std::vector<int> m_values = {256, 320, 384, 448, 512, 1024, 2048, 4096, 8192};
-	//std::vector<int> m_values = {16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256};
+    //std::vector<int> m_values = {256, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 2048, 4096, 8192};
+	std::vector<int> m_values = {16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256};
 
     std::vector<std::pair<int, int>> nk_pairs = {
         {2560, 2560},
@@ -67,7 +67,7 @@ int main() {
         {2560, 6912}
     };
 
-    const int num_runs = 10;
+    const int num_runs = 100;
 
     std::ofstream csv(kCsvFileName);
     if (!csv.is_open()) {

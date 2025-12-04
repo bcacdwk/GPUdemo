@@ -1,6 +1,6 @@
 // 稀疏在左：自动遍历所有算法ID并记录性能
 // $ nvcc -o sparse_L_search_all sparse_L_search_all.cu -lcusparseLt && ./sparse_L_search_all
-const char* kCsvFileName = "L_NT_RR_R_small_M.csv"; // 可修改的结果文件名
+const char* kCsvFileName = "L_NT_RR_R_smallM.csv"; // 可修改的结果文件名
 
 #include <cuda_runtime_api.h>
 #include <cusparseLt.h>

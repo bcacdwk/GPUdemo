@@ -1,6 +1,6 @@
 // 稀疏在右：自动遍历所有算法ID并记录性能
 // $ nvcc -o sparse_R_search_all sparse_R_search_all.cu -lcusparseLt && ./sparse_R_search_all
-const char* kCsvFileName = "R_NT_RR_C_small_M.csv"; // 可修改的结果文件名
+const char* kCsvFileName = "R_NT_RR_C_smallM.csv"; // 可修改的结果文件名
 
 #include <cuda_runtime_api.h>
 #include <cusparseLt.h>
@@ -75,7 +75,7 @@ int main() {
 		{2560, 6912}
 	};
 
-	const int num_runs = 10;
+	const int num_runs = 100;
 
 	cudaEvent_t start, stop;
 	CHECK_CUDA(cudaEventCreate(&start));
