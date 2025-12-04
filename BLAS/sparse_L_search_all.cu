@@ -66,7 +66,7 @@ int main() {
 	std::srand(static_cast<unsigned>(time(nullptr)));
 
 	//std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
-	std::vector<int> m_values = {32, 64, 96, 128, 160, 192, 224, 256};
+	std::vector<int> m_values = {16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256};
 
 	std::vector<std::pair<int, int>> nk_pairs = {
 		{2560, 2560},
