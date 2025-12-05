@@ -1,5 +1,7 @@
-// 稀疏在右：自动遍历所有算法ID并记录性能
-// $ nvcc -o sparse_R_search_all sparse_R_search_all.cu -lcusparseLt && ./sparse_R_search_all
+/*
+稀疏在右：自动遍历所有算法ID并记录性能，虽然我们推理用的是稀疏在左+NT，但是Kernel测试为了变量命名一致，所以稀疏放到右边+NT，但是速度是一样的
+nvcc -o sparse_R_search_all sparse_R_search_all.cu -lcusparseLt && ./sparse_R_search_all
+*/
 const char* kCsvFileName = "R_NT_RR_C_smallM.csv"; // 可修改的结果文件名
 
 #include <cuda_runtime_api.h>
@@ -65,6 +67,9 @@ struct cusparse_compute_type<int> {
 int main() {
 	std::srand(static_cast<unsigned>(time(nullptr)));
 
+	//这里执行的相当于是 R[M,N] = A[M,K] * W^T[N,K]，即稀疏矩阵在右侧+NT，Row-Row主序
+	//因为cusparselt要求denseA维度是16倍数；而sparseW维度是32倍数的，因此m必须是16的倍数
+	
 	//std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
 	std::vector<int> m_values = {16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256};
 

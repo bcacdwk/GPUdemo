@@ -1,10 +1,11 @@
-// cuBLAS 稀疏基准：固定 TN 配置的性能采样
-// $ nvcc -o cuBLAS_search_all_fp16 cuBLAS_search_all.cu -lcublas && ./cuBLAS_search_all_fp16
-// $ nvcc -o cuBLAS_search_all_int8 cuBLAS_search_all.cu -lcublas -DUSE_INT8 && ./cuBLAS_search_all_int8
-// nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=nsys_cublas ./cuBLAS_search_all_int8
+/*
+cuBLAS dense：固定 TN 配置，权重W在左的版本，也就是 列主序的 [K,N]^T * [K,M] = [N,M]，最终是行主序的[M,N]，真正的推理版本
+nvcc -o cuBLAS_L_search_all_fp16 cuBLAS_L_search_all.cu -lcublas && ./cuBLAS_L_search_all_fp16
+nvcc -o cuBLAS_L_search_all_int8 cuBLAS_L_search_all.cu -lcublas -DUSE_INT8 && ./cuBLAS_L_search_all_int8
+nsys profile --trace=cuda,nvtx,cublas,cudnn --cuda-memory-usage=true --stats=true --force-overwrite true --output=nsys_cublas ./cuBLAS_L_search_all_int8
+*/
 
-
-const char* kCsvFileName = "cuBLAS_TN_int8.csv"; // 可修改的结果文件名
+const char* kCsvFileName = "cuBLAS_L_TN_int8.csv"; // 可修改的结果文件名
 
 #include <cublas_v2.h>
 #include <cuda_runtime_api.h>
@@ -56,6 +57,8 @@ cublasComputeType_t computeType = CUBLAS_COMPUTE_16F;
 
 int main() {
     std::srand(static_cast<unsigned>(time(nullptr)));
+
+	//因为cuBLAS要求ld维度是4倍数；而这里的ld是k,k,n，因此 m 可以随意取
 
     //std::vector<int> m_values = {256, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 2048, 4096, 8192};
 	std::vector<int> m_values = {16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256};
@@ -128,22 +131,22 @@ int main() {
             st beta  = static_cast<st>(0);
 
             CHECK_CUBLAS(cublasGemmEx(handle,
-                                      CUBLAS_OP_T,
-                                      CUBLAS_OP_N,
-                                      m,
+                                      CUBLAS_OP_T, // W 矩阵转置
+                                      CUBLAS_OP_N, // A 矩阵不转置
                                       n,
+                                      m,
                                       k,
                                       &alpha,
-                                      dA,
+                                      dB,
                                       Atype,
                                       k,
-                                      dB,
+                                      dA,
                                       Btype,
                                       k,
                                       &beta,
                                       dC,
                                       Ctype,
-                                      m,
+                                      n,
                                       computeType,
                                       CUBLAS_GEMM_AUTOTUNE));
 
@@ -156,20 +159,20 @@ int main() {
                 CHECK_CUBLAS(cublasGemmEx(handle,
                                           CUBLAS_OP_T,
                                           CUBLAS_OP_N,
-                                          m,
                                           n,
+                                          m,
                                           k,
                                           &alpha,
-                                          dA,
+                                          dB,
                                           Atype,
                                           k,
-                                          dB,
+                                          dA,
                                           Btype,
                                           k,
                                           &beta,
                                           dC,
                                           Ctype,
-                                          m,
+                                          n,
                                           computeType,
                                           CUBLAS_GEMM_AUTOTUNE));
 
