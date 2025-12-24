@@ -2,10 +2,14 @@
 稀疏矩阵乘法Layout性能测试：遍历不同layout组合，记录最优算法ID
 nvcc -o layout_benchmark layout_benchmark.cu -lcusparseLt && ./layout_benchmark
 
-矩阵定义：
-  - W: 稀疏矩阵（左矩阵）
-  - A: 稠密矩阵（右矩阵）
-  - R: 输出矩阵
+矩阵乘法定义：
+  R[N,M] = W[N,K] * A[M,K]^T
+  - W: 稀疏权重矩阵 [N,K]（左矩阵）
+  - A: 稠密输入矩阵 [M,K]（右矩阵，需转置）
+  - R: 输出矩阵 [N,M]
+  - M: batch size（输入序列数）
+  - N: 输出特征维度（W的行数）
+  - K: 输入特征维度（共享维度）
 
 测试的layout组合（4种主要layout）：
   1. T/N + Col/Col (opW=T, opA=N, orderW=Col, orderA=Col)
@@ -14,7 +18,7 @@ nvcc -o layout_benchmark layout_benchmark.cu -lcusparseLt && ./layout_benchmark
   4. T/T + Col/Row (opW=T, opA=T, orderW=Col, orderA=Row)
 
 测试配置：
-  - M列表: [16, 64, 256, 1024]
+  - M列表: [16, 256, 2048, 16384]
   - (N,K) pairs: Wqkv(3840,2560), Wo(2560,2560), W13(13824,2560), W2(2560,6912)
 
 对于每种layout组合，分别测试 R=Row 和 R=Col 两种输出布局，
@@ -207,8 +211,14 @@ int testLayoutConfig(
     // 根据cuSPARSELt的矩阵乘法定义：
     // C = alpha * op(A) * op(B) + beta * C
     // 这里 matA=W(稀疏), matB=A(稠密), matC=R(输出)
-    // op(W) 的维度: [M, K] 或 [K, M] 取决于是否转置
-    // op(A) 的维度: [K, N] 或 [N, K] 取决于是否转置
+    // 
+    // 用户定义的矩阵乘法: R[N,M] = W[N,K] * A[M,K]^T
+    //   - W: 稀疏权重矩阵 [N,K]
+    //   - A: 稠密输入矩阵 [M,K]，需要转置后参与运算
+    //   - R: 输出矩阵 [N,M]
+    //
+    // op(W) 的逻辑维度: [N, K]（不转置）或 [K, N]（转置）
+    // op(A) 的逻辑维度: [K, M]（转置后）或 [M, K]（不转置）
 
     bool isW_transposed = (opW == CUSPARSE_OPERATION_TRANSPOSE);
     bool isA_transposed = (opA == CUSPARSE_OPERATION_TRANSPOSE);
@@ -217,14 +227,16 @@ int testLayoutConfig(
     bool isR_rowmajor   = (orderR == CUSPARSE_ORDER_ROW);
 
     // 稀疏矩阵W的存储维度
-    int num_W_rows = isW_transposed ? K : M;
-    int num_W_cols = isW_transposed ? M : K;
+    // W[N,K]：不转置时存储为[N,K]，转置时存储为[K,N]
+    int num_W_rows = isW_transposed ? K : N;
+    int num_W_cols = isW_transposed ? N : K;
     // 稠密矩阵A的存储维度
-    int num_A_rows = isA_transposed ? N : K;
-    int num_A_cols = isA_transposed ? K : N;
-    // 输出矩阵R的维度
-    int num_R_rows = M;
-    int num_R_cols = N;
+    // A[M,K]：转置时存储为[M,K]（逻辑维度[K,M]），不转置时存储为[K,M]
+    int num_A_rows = isA_transposed ? M : K;
+    int num_A_cols = isA_transposed ? K : M;
+    // 输出矩阵R的维度 [N,M]
+    int num_R_rows = N;
+    int num_R_cols = M;
 
     // 计算leading dimension
     int ldw = isW_rowmajor ? num_W_cols : num_W_rows;
