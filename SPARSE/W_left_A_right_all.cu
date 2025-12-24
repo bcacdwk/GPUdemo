@@ -75,7 +75,7 @@ int main() {
 
 	// M values: 稠密矩阵 A 的行数（也是结果矩阵的列数）
 	//std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
-	std::vector<int> m_values = {32, 64, 96, 128, 160, 192, 224, 256};
+	std::vector<int> m_values = {1024};
 
 	// (N, K) pairs: N 是稀疏矩阵 W 的行数（结果矩阵的行数），K 是共享维度
 	std::vector<std::pair<int, int>> nk_pairs = {

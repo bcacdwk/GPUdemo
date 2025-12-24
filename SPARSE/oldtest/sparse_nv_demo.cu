@@ -389,12 +389,12 @@ int main() {
     // Matrix multiplication parameters
     const float      alpha      = 1.0f;
     const float      beta       = 0.0f;
-    const char       trans_A    = 'N';
+    const char       trans_A    = 'T';
     const char       trans_B    = 'N';
     const char       layout_A   = 'C';
-    const char       layout_B   = 'R';
+    const char       layout_B   = 'C';
     const char       layout_C   = 'R';
-    const bool       is_A_sparse = false; // toggle if you want sparse B instead
+    const bool       is_A_sparse = true; // toggle if you want sparse B instead
 
     std::mt19937 rng(42);
     std::uniform_int_distribution<int> dist(-1, 1);
