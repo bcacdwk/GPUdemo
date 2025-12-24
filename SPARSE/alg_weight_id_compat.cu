@@ -284,9 +284,9 @@ int runCompatTest(int m, int n, int k, const std::string& csvPath, bool verbose 
 		CHECK_CUSPARSE(cusparseLtMatmulAlgSelectionDestroy(&alg_sel_tmp));
 	}
 
-	std::cout << "算法ID范围: 0 ~ " << max_alg_id << " (共 " << (max_alg_id + 1) << " 个算法)" << std::endl;
+	std::cout << "算法ID范围: 1 ~ " << max_alg_id << " (共 " << max_alg_id << " 个算法)" << std::endl;
 
-	const int num_algs = max_alg_id + 1;
+	const int num_algs = max_alg_id + 1;  // 数组大小保持不变，但只使用索引1~max_alg_id
 
 	// ============================================================
 	// 阶段1：为每个算法ID创建plan并压缩权重
@@ -298,7 +298,7 @@ int runCompatTest(int m, int n, int k, const std::string& csvPath, bool verbose 
 	std::vector<AB_t*> compressed_weights(num_algs, nullptr);
 	std::vector<bool> alg_valid(num_algs, false);
 
-	for (int alg_id = 0; alg_id < num_algs; ++alg_id) {
+	for (int alg_id = 1; alg_id < num_algs; ++alg_id) {  // 从ID=1开始，跳过ID=0
 		// 初始化算法选择
 		cusparseStatus_t status = cusparseLtMatmulAlgSelectionInit(
 			&handle, &alg_sels[alg_id], &matmul, CUSPARSELT_MATMUL_ALG_DEFAULT);
@@ -380,10 +380,10 @@ int runCompatTest(int m, int n, int k, const std::string& csvPath, bool verbose 
 
 	// 统计有效算法数量
 	int valid_count = 0;
-	for (int i = 0; i < num_algs; ++i) {
+	for (int i = 1; i < num_algs; ++i) {  // 从ID=1开始统计
 		if (alg_valid[i]) valid_count++;
 	}
-	std::cout << "有效算法数量: " << valid_count << " / " << num_algs << std::endl;
+	std::cout << "有效算法数量: " << valid_count << " / " << (num_algs - 1) << std::endl;  // 总数减1（不含ID=0）
 
 	if (valid_count == 0) {
 		std::cerr << "错误：没有有效的算法！" << std::endl;
@@ -397,7 +397,7 @@ int runCompatTest(int m, int n, int k, const std::string& csvPath, bool verbose 
 
 	std::vector<std::vector<C_t>> golden_results(num_algs);
 
-	for (int alg_id = 0; alg_id < num_algs; ++alg_id) {
+	for (int alg_id = 1; alg_id < num_algs; ++alg_id) {  // 从ID=1开始
 		if (!alg_valid[alg_id]) continue;
 
 		// 获取workspace大小
@@ -441,7 +441,7 @@ int runCompatTest(int m, int n, int k, const std::string& csvPath, bool verbose 
 	// 检查所有golden结果是否相同
 	std::cout << "\n[调试] 检查golden结果一致性..." << std::endl;
 	int first_valid = -1;
-	for (int i = 0; i < num_algs; ++i) {
+	for (int i = 1; i < num_algs; ++i) {  // 从ID=1开始
 		if (alg_valid[i]) { first_valid = i; break; }
 	}
 	if (first_valid >= 0) {
@@ -472,12 +472,12 @@ int runCompatTest(int m, int n, int k, const std::string& csvPath, bool verbose 
 
 	std::vector<C_t> test_result(C_elems);
 
-	for (int weight_id = 0; weight_id < num_algs; ++weight_id) {
+	for (int weight_id = 1; weight_id < num_algs; ++weight_id) {  // 从ID=1开始
 		if (!alg_valid[weight_id]) continue;
 
 		std::cout << "  测试权重ID " << weight_id << " ..." << std::endl;
 
-		for (int alg_id = 0; alg_id < num_algs; ++alg_id) {
+		for (int alg_id = 1; alg_id < num_algs; ++alg_id) {  // 从ID=1开始
 			if (!alg_valid[alg_id]) continue;
 
 			// 获取workspace
@@ -537,15 +537,15 @@ int runCompatTest(int m, int n, int k, const std::string& csvPath, bool verbose 
 	// 打印到控制台
 	std::cout << "\n兼容性矩阵 (行=算法ID, 列=权重ID):" << std::endl;
 	std::cout << "     ";
-	for (int j = 0; j < num_algs; ++j) {
+	for (int j = 1; j < num_algs; ++j) {  // 从ID=1开始
 		if (alg_valid[j]) std::cout << "W" << j << " ";
 	}
 	std::cout << std::endl;
 
-	for (int i = 0; i < num_algs; ++i) {
+	for (int i = 1; i < num_algs; ++i) {  // 从ID=1开始
 		if (!alg_valid[i]) continue;
 		std::cout << "A" << i << ":  ";
-		for (int j = 0; j < num_algs; ++j) {
+		for (int j = 1; j < num_algs; ++j) {  // 从ID=1开始
 			if (!alg_valid[j]) continue;
 			if (compat_matrix[i][j] == 1) {
 				std::cout << " 1  ";
@@ -565,18 +565,18 @@ int runCompatTest(int m, int n, int k, const std::string& csvPath, bool verbose 
 		return EXIT_FAILURE;
 	}
 
-	// CSV表头：AlgID, W0, W1, W2, ...
+	// CSV表头：AlgID, W1, W2, W3, ... (跳过W0)
 	csv << "AlgID";
-	for (int j = 0; j < num_algs; ++j) {
+	for (int j = 1; j < num_algs; ++j) {  // 从ID=1开始
 		if (alg_valid[j]) csv << ",W" << j;
 	}
 	csv << "\n";
 
 	// CSV数据
-	for (int i = 0; i < num_algs; ++i) {
+	for (int i = 1; i < num_algs; ++i) {  // 从ID=1开始
 		if (!alg_valid[i]) continue;
 		csv << "A" << i;
-		for (int j = 0; j < num_algs; ++j) {
+		for (int j = 1; j < num_algs; ++j) {  // 从ID=1开始
 			if (!alg_valid[j]) continue;
 			csv << "," << (compat_matrix[i][j] == 1 ? 1 : 0);
 		}
@@ -586,9 +586,9 @@ int runCompatTest(int m, int n, int k, const std::string& csvPath, bool verbose 
 
 	// 统计分析
 	int diagonal_match = 0, off_diagonal_match = 0, total_tests = 0;
-	for (int i = 0; i < num_algs; ++i) {
+	for (int i = 1; i < num_algs; ++i) {  // 从ID=1开始
 		if (!alg_valid[i]) continue;
-		for (int j = 0; j < num_algs; ++j) {
+		for (int j = 1; j < num_algs; ++j) {  // 从ID=1开始
 			if (!alg_valid[j]) continue;
 			if (compat_matrix[i][j] == 1) {
 				if (i == j) diagonal_match++;
@@ -609,7 +609,7 @@ int runCompatTest(int m, int n, int k, const std::string& csvPath, bool verbose 
 	// ============================================================
 	// 清理资源
 	// ============================================================
-	for (int i = 0; i < num_algs; ++i) {
+	for (int i = 1; i < num_algs; ++i) {  // 从ID=1开始
 		if (alg_valid[i]) {
 			if (compressed_weights[i]) cudaFree(compressed_weights[i]);
 			cusparseLtMatmulPlanDestroy(&plans[i]);
