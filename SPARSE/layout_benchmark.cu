@@ -118,6 +118,7 @@ const char* getOrderName(cusparseOrder_t order) {
 
 // 测试单个layout配置的函数
 // 返回值：0=成功，-1=CUDA错误，10=操作不支持
+// out_max_alg_id：输出最大算法ID
 int testLayoutConfig(
     const LayoutConfig& config,
     cusparseOrder_t orderR,  // 输出矩阵R的存储顺序
@@ -125,8 +126,10 @@ int testLayoutConfig(
     int num_runs,
     cudaEvent_t& start,
     cudaEvent_t& stop,
-    std::vector<AlgResult>& results  // 输出：所有有效算法的结果
+    std::vector<AlgResult>& results,  // 输出：所有有效算法的结果
+    int& out_max_alg_id  // 输出：最大允许算法ID
 ) {
+    out_max_alg_id = -1;
     results.clear();
 
     // 矩阵乘法: R = W * A
@@ -367,6 +370,7 @@ int testLayoutConfig(
     }
 
     std::cout << "  最大算法ID: " << max_alg_id << std::endl;
+    out_max_alg_id = max_alg_id;  // 输出最大算法ID
 
     // 遍历所有算法ID
     for (int alg_id = 0; alg_id <= max_alg_id; ++alg_id) {
@@ -570,9 +574,9 @@ int main() {
 
     // CSV表头
     csv << "Layout,N,K,M,"
-        << "R_Row_Top1_ID,R_Row_Top2_ID,R_Row_Top3_ID,"
+        << "R_Row_MaxAlgID,R_Row_Top1_ID,R_Row_Top2_ID,R_Row_Top3_ID,"
         << "R_Row_Top1_TOPS,R_Row_Top2_TOPS,R_Row_Top3_TOPS,"
-        << "R_Col_Top1_ID,R_Col_Top2_ID,R_Col_Top3_ID,"
+        << "R_Col_MaxAlgID,R_Col_Top1_ID,R_Col_Top2_ID,R_Col_Top3_ID,"
         << "R_Col_Top1_TOPS,R_Col_Top2_TOPS,R_Col_Top3_TOPS\n";
 
     // 遍历所有NK组合
@@ -595,11 +599,12 @@ int main() {
 
             std::vector<AlgResult> results_row, results_col;
             bool row_valid = false, col_valid = false;
+            int max_alg_id_row = -1, max_alg_id_col = -1;  // 最大算法ID
 
             // 测试R=Row布局
             std::cout << "\n  测试 R=Row 布局..." << std::endl;
             int ret_row = testLayoutConfig(
-                config, CUSPARSE_ORDER_ROW, M, N, K, num_runs, start, stop, results_row);
+                config, CUSPARSE_ORDER_ROW, M, N, K, num_runs, start, stop, results_row, max_alg_id_row);
 
             if (ret_row == 0 && !results_row.empty()) {
                 row_valid = true;
@@ -618,7 +623,7 @@ int main() {
             // 测试R=Col布局
             std::cout << "\n  测试 R=Col 布局..." << std::endl;
             int ret_col = testLayoutConfig(
-                config, CUSPARSE_ORDER_COL, M, N, K, num_runs, start, stop, results_col);
+                config, CUSPARSE_ORDER_COL, M, N, K, num_runs, start, stop, results_col, max_alg_id_col);
 
             if (ret_col == 0 && !results_col.empty()) {
                 col_valid = true;
@@ -638,8 +643,9 @@ int main() {
             if (row_valid || col_valid) {
                 csv << config.name << "," << N << "," << K << "," << M << ",";
 
-                // R=Row的Top3
+                // R=Row的MaxAlgID和Top3
                 if (row_valid) {
+                    csv << max_alg_id_row << ",";  // 输出最大算法ID
                     for (int i = 0; i < 3; ++i) {
                         if (i < static_cast<int>(results_row.size())) {
                             csv << results_row[i].alg_id;
@@ -657,20 +663,20 @@ int main() {
                         csv << ",";
                     }
                 } else {
-                    csv << "-1,-1,-1,0,0,0,";
+                    csv << "-1,-1,-1,-1,0,0,0,";  // 包含MaxAlgID=-1
                 }
 
-                // R=Col的Top3
+                // R=Col的MaxAlgID和Top3
                 if (col_valid) {
+                    csv << max_alg_id_col << ",";  // 输出最大算法ID
                     for (int i = 0; i < 3; ++i) {
                         if (i < static_cast<int>(results_col.size())) {
                             csv << results_col[i].alg_id;
                         } else {
                             csv << "-1";
                         }
-                        if (i < 2) csv << ",";
+                        csv << ",";
                     }
-                    csv << ",";
                     for (int i = 0; i < 3; ++i) {
                         if (i < static_cast<int>(results_col.size())) {
                             csv << results_col[i].throughput;
@@ -680,7 +686,7 @@ int main() {
                         if (i < 2) csv << ",";
                     }
                 } else {
-                    csv << "-1,-1,-1,0,0,0";
+                    csv << "-1,-1,-1,-1,0,0,0";  // 包含MaxAlgID=-1
                 }
 
                 csv << "\n";
