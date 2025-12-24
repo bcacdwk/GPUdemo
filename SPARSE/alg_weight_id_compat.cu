@@ -1,17 +1,25 @@
 /*
 算法-权重兼容性测试：验证不同算法ID压缩的权重能否混用
 测试逻辑：
-  1. 固定维度 M=1024, N=3840, K=2560，计算 R[N,M] = W[N,K] * A^T[M,K]
-  2. 对每个算法ID分别压缩一份权重，得到 num_algs 份压缩权重
-  3. 先用 算法i + 权重i (一一对应) 计算得到 golden[i]
-  4. 然后对每个权重j，遍历所有算法i，用算法i计算权重j的结果，与golden[j]比较
-  5. 输出兼容性矩阵：matrix[alg_i][weight_j] = 1 表示算法i可以使用权重j
+  1. 遍历多个维度配置：M列表 × (N,K) pairs
+     - M列表: [16, 64, 256, 1024]
+     - (N,K) pairs: Wqkv(3840,2560), Wo(2560,2560), W13(13824,2560), W2(2560,6912)
+  2. 计算 R[N,M] = W[N,K] * A^T[M,K]
+  3. 对每个算法ID分别压缩一份权重，得到 num_algs 份压缩权重
+  4. 先用 算法i + 权重i (一一对应) 计算得到 golden[i]
+  5. 然后对每个权重j，遍历所有算法i，用算法i计算权重j的结果，与golden[j]比较
+  6. 输出兼容性矩阵：matrix[alg_i][weight_j] = 1 表示算法i可以使用权重j
+
+输出目录结构：
+  alg_weight_compat_matrix/
+    └── <GPU名称>/           (如 A100, B200)
+        ├── m_16_n_3840_k_2560.csv
+        ├── m_16_n_2560_k_2560.csv
+        └── ...
 
 编译运行:
 nvcc -o alg_weight_id_compat alg_weight_id_compat.cu -lcusparseLt && ./alg_weight_id_compat
 */
-
-const char* kCsvFileName = "alg_weight_compat_matrix.csv";
 
 #include <cuda_runtime_api.h>
 #include <cusparseLt.h>
@@ -23,6 +31,8 @@ const char* kCsvFileName = "alg_weight_compat_matrix.csv";
 #include <iostream>
 #include <vector>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 using AB_t      = int8_t;
 using C_t       = int;
@@ -48,6 +58,58 @@ template <>
 struct cusparse_compute_type<int> {
 	static constexpr cusparseComputeType value = CUSPARSE_COMPUTE_32I;
 };
+
+// (N, K) pairs 配置，对应不同的权重矩阵
+struct NKPair {
+	int n;
+	int k;
+	std::string name;
+};
+
+// 获取GPU名称（简化版，如 A100, B200）
+std::string getGpuName() {
+	cudaDeviceProp prop;
+	cudaGetDeviceProperties(&prop, 0);
+	std::string fullName = prop.name;
+	
+	// 提取GPU型号关键字（如 A100, H100, B200 等）
+	// 常见格式: "NVIDIA A100-SXM4-40GB" -> "A100"
+	//          "NVIDIA H100 PCIe" -> "H100"
+	std::string shortName = fullName;
+	
+	// 移除 "NVIDIA " 前缀
+	size_t nvidia_pos = fullName.find("NVIDIA ");
+	if (nvidia_pos != std::string::npos) {
+		shortName = fullName.substr(nvidia_pos + 7);
+	}
+	
+	// 提取第一个空格或连字符之前的部分作为GPU型号
+	size_t end_pos = shortName.find_first_of(" -");
+	if (end_pos != std::string::npos) {
+		shortName = shortName.substr(0, end_pos);
+	}
+	
+	// 如果提取失败，使用清理后的完整名称（替换空格和特殊字符）
+	if (shortName.empty()) {
+		shortName = fullName;
+		for (char& c : shortName) {
+			if (c == ' ' || c == '-' || c == '/') c = '_';
+		}
+	}
+	
+	return shortName;
+}
+
+// 创建目录（递归创建）
+bool createDirectory(const std::string& path) {
+	size_t pos = 0;
+	std::string dir;
+	while ((pos = path.find('/', pos + 1)) != std::string::npos) {
+		dir = path.substr(0, pos);
+		mkdir(dir.c_str(), 0755);
+	}
+	return mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
+}
 
 #define CHECK_CUDA(func)                                                        \
 {                                                                               \
@@ -95,20 +157,18 @@ bool compare_results(const std::vector<C_t>& a, const std::vector<C_t>& b) {
 	return true;
 }
 
-int main() {
+// 对单个 (m, n, k) 配置执行兼容性测试
+// 返回值：0 成功，非0 失败
+int runCompatTest(int m, int n, int k, const std::string& csvPath, bool verbose = true) {
 	std::srand(42);  // 固定种子，保证可复现
 
-	// 固定维度：R[N,M] = W[N,K] * A^T[M,K]
-	const int m = 1024;  // dense A 的行数，结果矩阵的列数
-	const int n = 3840;  // sparse W 的行数，结果矩阵的行数
-	const int k = 2560;  // 共享维度
-
-	std::cout << "========================================" << std::endl;
-	std::cout << "算法-权重兼容性测试" << std::endl;
-	std::cout << "维度: M=" << m << ", N=" << n << ", K=" << k << std::endl;
-	std::cout << "计算: R[" << n << "," << m << "] = W[" << n << "," << k 
-			  << "] * A^T[" << m << "," << k << "]" << std::endl;
-	std::cout << "========================================" << std::endl;
+	if (verbose) {
+		std::cout << "\n----------------------------------------" << std::endl;
+		std::cout << "测试维度: M=" << m << ", N=" << n << ", K=" << k << std::endl;
+		std::cout << "计算: R[" << n << "," << m << "] = W[" << n << "," << k 
+				  << "] * A^T[" << m << "," << k << "]" << std::endl;
+		std::cout << "----------------------------------------" << std::endl;
+	}
 
 	// 矩阵配置
 	auto orderA        = CUSPARSE_ORDER_ROW;
@@ -499,9 +559,9 @@ int main() {
 	}
 
 	// 输出到CSV
-	std::ofstream csv(kCsvFileName);
+	std::ofstream csv(csvPath);
 	if (!csv.is_open()) {
-		std::cerr << "无法创建结果文件 " << kCsvFileName << std::endl;
+		std::cerr << "无法创建结果文件 " << csvPath << std::endl;
 		return EXIT_FAILURE;
 	}
 
@@ -543,7 +603,7 @@ int main() {
 	std::cout << "  对角线匹配(应该全为1): " << diagonal_match << " / " << valid_count << std::endl;
 	std::cout << "  非对角线匹配(权重可混用): " << off_diagonal_match << " / " 
 			  << (total_tests - valid_count) << std::endl;
-	std::cout << "  结果已写入: " << kCsvFileName << std::endl;
+	std::cout << "  结果已写入: " << csvPath << std::endl;
 	std::cout << "========================================" << std::endl;
 
 	// ============================================================
@@ -568,4 +628,105 @@ int main() {
 	cudaFree(d_valid);
 
 	return EXIT_SUCCESS;
+}
+
+int main() {
+	// ============================================================
+	// 配置参数
+	// ============================================================
+	
+	// M值列表（dense矩阵A的行数，即batch size）
+	std::vector<int> m_list = {16, 256, 2048, 16384};
+	
+	// (N, K) pairs 配置，对应不同的权重矩阵
+	std::vector<NKPair> nk_pairs = {
+		{3840, 2560, "Wqkv"},    // Wqkv: (3840, 2560)
+		{2560, 2560, "Wo"},      // Wo:   (2560, 2560)
+		{13824, 2560, "W13"},    // W13:  (13824, 2560)
+		{2560, 6912, "W2"}       // W2:   (2560, 6912)
+	};
+	
+	// ============================================================
+	// 获取GPU信息并创建输出目录
+	// ============================================================
+	std::string gpuName = getGpuName();
+	std::cout << "========================================" << std::endl;
+	std::cout << "算法-权重兼容性测试" << std::endl;
+	std::cout << "检测到GPU: " << gpuName << std::endl;
+	std::cout << "========================================" << std::endl;
+	
+	// 创建输出目录: alg_weight_compat_matrix/<GPU名称>/
+	std::string baseDir = "alg_weight_compat_matrix";
+	std::string outputDir = baseDir + "/" + gpuName;
+	
+	createDirectory(outputDir);
+	std::cout << "输出目录: " << outputDir << std::endl;
+	
+	// ============================================================
+	// 打印测试配置
+	// ============================================================
+	std::cout << "\n测试配置:" << std::endl;
+	std::cout << "  M值列表: [";
+	for (size_t i = 0; i < m_list.size(); ++i) {
+		std::cout << m_list[i];
+		if (i < m_list.size() - 1) std::cout << ", ";
+	}
+	std::cout << "]" << std::endl;
+	
+	std::cout << "  (N, K) pairs:" << std::endl;
+	for (const auto& nk : nk_pairs) {
+		std::cout << "    " << nk.name << ": (" << nk.n << ", " << nk.k << ")" << std::endl;
+	}
+	
+	int total_tests = m_list.size() * nk_pairs.size();
+	std::cout << "  总测试数: " << total_tests << std::endl;
+	
+	// ============================================================
+	// 双层循环：外层M，内层(N,K)
+	// ============================================================
+	int test_idx = 0;
+	int success_count = 0;
+	int fail_count = 0;
+	
+	for (int m : m_list) {
+		for (const auto& nk : nk_pairs) {
+			test_idx++;
+			int n = nk.n;
+			int k = nk.k;
+			
+			std::cout << "\n########################################" << std::endl;
+			std::cout << "测试 [" << test_idx << "/" << total_tests << "]: "
+					  << nk.name << " M=" << m << ", N=" << n << ", K=" << k << std::endl;
+			std::cout << "########################################" << std::endl;
+			
+			// 构造CSV文件路径: m_XXX_n_XXX_k_XXX.csv
+			std::string csvFileName = "m_" + std::to_string(m) 
+									+ "_n_" + std::to_string(n) 
+									+ "_k_" + std::to_string(k) + ".csv";
+			std::string csvPath = outputDir + "/" + csvFileName;
+			
+			// 执行兼容性测试
+			int ret = runCompatTest(m, n, k, csvPath, true);
+			
+			if (ret == EXIT_SUCCESS) {
+				success_count++;
+				std::cout << "测试 [" << test_idx << "] 完成: " << csvFileName << std::endl;
+			} else {
+				fail_count++;
+				std::cerr << "测试 [" << test_idx << "] 失败: " << csvFileName << std::endl;
+			}
+		}
+	}
+	
+	// ============================================================
+	// 汇总结果
+	// ============================================================
+	std::cout << "\n========================================" << std::endl;
+	std::cout << "全部测试完成!" << std::endl;
+	std::cout << "  成功: " << success_count << " / " << total_tests << std::endl;
+	std::cout << "  失败: " << fail_count << " / " << total_tests << std::endl;
+	std::cout << "  输出目录: " << outputDir << std::endl;
+	std::cout << "========================================" << std::endl;
+	
+	return (fail_count == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

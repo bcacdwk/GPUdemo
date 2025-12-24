@@ -7,23 +7,28 @@ nvcc -o layout_benchmark layout_benchmark.cu -lcusparseLt && ./layout_benchmark
   - A: 稠密矩阵（右矩阵）
   - R: 输出矩阵
 
-测试的layout组合：
-  主要测试（预期可工作）：
-    1. T/N + Col/Col (opW=T, opA=N, orderW=Col, orderA=Col)
-    2. N/T + Row/Row (opW=N, opA=T, orderW=Row, orderA=Row)
-    3. N/N + Row/Col (opW=N, opA=N, orderW=Row, orderA=Col)
-    4. T/T + Col/Row (opW=T, opA=T, orderW=Col, orderA=Row)
-  次要测试（可能不支持，错误码10则跳过）：
-    5. N/T + Col/Col
-    6. T/N + Row/Row
-    7. T/T + Row/Col
-    8. N/N + Col/Row
+测试的layout组合（4种主要layout）：
+  1. T/N + Col/Col (opW=T, opA=N, orderW=Col, orderA=Col)
+  2. N/T + Row/Row (opW=N, opA=T, orderW=Row, orderA=Row)
+  3. N/N + Row/Col (opW=N, opA=N, orderW=Row, orderA=Col)
+  4. T/T + Col/Row (opW=T, opA=T, orderW=Col, orderA=Row)
 
-对于每种有效的layout组合，分别测试 R=Row 和 R=Col 两种输出布局，
+测试配置：
+  - M列表: [16, 64, 256, 1024]
+  - (N,K) pairs: Wqkv(3840,2560), Wo(2560,2560), W13(13824,2560), W2(2560,6912)
+
+对于每种layout组合，分别测试 R=Row 和 R=Col 两种输出布局，
 记录 top3 算法ID 和对应的 TOPS。
-*/
 
-const char* kCsvFileName = "layout_benchmark_result.csv";
+输出目录结构：
+  layout_benchmark_results/
+    └── <GPU名称>/           (如 A100, B200)
+        ├── n_3840_k_2560.csv
+        ├── n_2560_k_2560.csv
+        └── ...
+
+CSV格式：按M排序，相同M下按4种layout顺序排列
+*/
 
 #include <cuda_runtime_api.h>
 #include <cusparseLt.h>
@@ -38,6 +43,8 @@ const char* kCsvFileName = "layout_benchmark_result.csv";
 #include <string>
 #include <sstream>
 #include <algorithm>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 using AB_t      = int8_t;
 using C_t       = int;
@@ -63,6 +70,58 @@ template <>
 struct cusparse_compute_type<int> {
     static constexpr cusparseComputeType value = CUSPARSE_COMPUTE_32I;
 };
+
+// (N, K) pairs 配置，对应不同的权重矩阵
+struct NKPair {
+    int n;
+    int k;
+    std::string name;
+};
+
+// 获取GPU名称（简化版，如 A100, B200）
+std::string getGpuName() {
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    std::string fullName = prop.name;
+    
+    // 提取GPU型号关键字（如 A100, H100, B200 等）
+    // 常见格式: "NVIDIA A100-SXM4-40GB" -> "A100"
+    //          "NVIDIA H100 PCIe" -> "H100"
+    std::string shortName = fullName;
+    
+    // 移除 "NVIDIA " 前缀
+    size_t nvidia_pos = fullName.find("NVIDIA ");
+    if (nvidia_pos != std::string::npos) {
+        shortName = fullName.substr(nvidia_pos + 7);
+    }
+    
+    // 提取第一个空格或连字符之前的部分作为GPU型号
+    size_t end_pos = shortName.find_first_of(" -");
+    if (end_pos != std::string::npos) {
+        shortName = shortName.substr(0, end_pos);
+    }
+    
+    // 如果提取失败，使用清理后的完整名称（替换空格和特殊字符）
+    if (shortName.empty()) {
+        shortName = fullName;
+        for (char& c : shortName) {
+            if (c == ' ' || c == '-' || c == '/') c = '_';
+        }
+    }
+    
+    return shortName;
+}
+
+// 创建目录（递归创建）
+bool createDirectory(const std::string& path) {
+    size_t pos = 0;
+    std::string dir;
+    while ((pos = path.find('/', pos + 1)) != std::string::npos) {
+        dir = path.substr(0, pos);
+        mkdir(dir.c_str(), 0755);
+    }
+    return mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
+}
 
 #define CHECK_CUDA(func)                                                        \
 {                                                                               \
@@ -530,18 +589,25 @@ int testLayoutConfig(
 int main() {
     std::srand(static_cast<unsigned>(time(nullptr)));
 
-    // 固定M=4096
-    const int M = 4096;
-    const int num_runs = 10;
+    // ============================================================
+    // 配置参数
+    // ============================================================
+    
+    // M值列表（dense矩阵A的行数，即batch size）
+	std::vector<int> m_list = {16, 256, 2048, 16384};
+    
+    const int num_runs = 10;  // 每个配置运行次数
 
-    // (N, K) pairs
-    std::vector<std::pair<int, int>> nk_pairs = {
-        {3840, 2560},
+    // (N, K) pairs 配置，对应不同的权重矩阵
+    std::vector<NKPair> nk_pairs = {
+        {3840, 2560, "Wqkv"},    // Wqkv: (3840, 2560)
+        {2560, 2560, "Wo"},      // Wo:   (2560, 2560)
+        {13824, 2560, "W13"},    // W13:  (13824, 2560)
+        {2560, 6912, "W2"}       // W2:   (2560, 6912)
     };
 
-    // 定义所有layout配置
+    // 定义4种主要layout配置（按指定顺序）
     std::vector<LayoutConfig> configs = {
-        // 主要测试（预期可工作）
         {"T/N+Col/Col", CUSPARSE_OPERATION_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
          CUSPARSE_ORDER_COL, CUSPARSE_ORDER_COL, true},
         {"N/T+Row/Row", CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_TRANSPOSE,
@@ -550,102 +616,153 @@ int main() {
          CUSPARSE_ORDER_ROW, CUSPARSE_ORDER_COL, true},
         {"T/T+Col/Row", CUSPARSE_OPERATION_TRANSPOSE, CUSPARSE_OPERATION_TRANSPOSE,
          CUSPARSE_ORDER_COL, CUSPARSE_ORDER_ROW, true},
-        // 次要测试（可能不支持）
-        {"N/T+Col/Col", CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_TRANSPOSE,
-         CUSPARSE_ORDER_COL, CUSPARSE_ORDER_COL, false},
-        {"T/N+Row/Row", CUSPARSE_OPERATION_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
-         CUSPARSE_ORDER_ROW, CUSPARSE_ORDER_ROW, false},
-        {"T/T+Row/Col", CUSPARSE_OPERATION_TRANSPOSE, CUSPARSE_OPERATION_TRANSPOSE,
-         CUSPARSE_ORDER_ROW, CUSPARSE_ORDER_COL, false},
-        {"N/N+Col/Row", CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
-         CUSPARSE_ORDER_COL, CUSPARSE_ORDER_ROW, false},
     };
+
+    // ============================================================
+    // 获取GPU信息并创建输出目录
+    // ============================================================
+    std::string gpuName = getGpuName();
+    std::cout << "========================================" << std::endl;
+    std::cout << "Layout性能测试" << std::endl;
+    std::cout << "检测到GPU: " << gpuName << std::endl;
+    std::cout << "========================================" << std::endl;
+    
+    // 创建输出目录: layout_benchmark_results/<GPU名称>/
+    std::string baseDir = "layout_benchmark_results";
+    std::string outputDir = baseDir + "/" + gpuName;
+    
+    createDirectory(outputDir);
+    std::cout << "输出目录: " << outputDir << std::endl;
+    
+    // ============================================================
+    // 打印测试配置
+    // ============================================================
+    std::cout << "\n测试配置:" << std::endl;
+    std::cout << "  M值列表: [";
+    for (size_t i = 0; i < m_list.size(); ++i) {
+        std::cout << m_list[i];
+        if (i < m_list.size() - 1) std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
+    
+    std::cout << "  (N, K) pairs:" << std::endl;
+    for (const auto& nk : nk_pairs) {
+        std::cout << "    " << nk.name << ": (" << nk.n << ", " << nk.k << ")" << std::endl;
+    }
+    
+    std::cout << "  Layout配置:" << std::endl;
+    for (const auto& cfg : configs) {
+        std::cout << "    " << cfg.name << std::endl;
+    }
+    
+    int total_nk = nk_pairs.size();
+    int total_m = m_list.size();
+    int total_layouts = configs.size();
+    std::cout << "  总CSV文件数: " << total_nk << std::endl;
+    std::cout << "  每个CSV测试数: " << total_m << " × " << total_layouts << " = " 
+              << (total_m * total_layouts) << std::endl;
 
     cudaEvent_t start, stop;
     CHECK_CUDA_MAIN(cudaEventCreate(&start));
     CHECK_CUDA_MAIN(cudaEventCreate(&stop));
 
-    // 打开CSV文件
-    std::ofstream csv(kCsvFileName);
-    if (!csv.is_open()) {
-        std::cerr << "无法创建结果文件 " << kCsvFileName << std::endl;
-        return EXIT_FAILURE;
-    }
+    // ============================================================
+    // 外层循环：遍历(N,K) pairs，每个pair生成一个CSV文件
+    // ============================================================
+    int nk_idx = 0;
+    for (const auto& nk : nk_pairs) {
+        nk_idx++;
+        int N = nk.n;
+        int K = nk.k;
+        
+        std::cout << "\n########################################" << std::endl;
+        std::cout << "处理 [" << nk_idx << "/" << total_nk << "]: " 
+                  << nk.name << " (N=" << N << ", K=" << K << ")" << std::endl;
+        std::cout << "########################################" << std::endl;
+        
+        // 构造CSV文件路径: n_XXX_k_XXX.csv
+        std::string csvFileName = "n_" + std::to_string(N) + "_k_" + std::to_string(K) + ".csv";
+        std::string csvPath = outputDir + "/" + csvFileName;
+        
+        // 打开CSV文件
+        std::ofstream csv(csvPath);
+        if (!csv.is_open()) {
+            std::cerr << "无法创建结果文件 " << csvPath << std::endl;
+            continue;
+        }
+        
+        // CSV表头：M在前，然后是Layout
+        csv << "M,Layout,N,K,"
+            << "R_Row_MaxAlgID,R_Row_Top1_ID,R_Row_Top2_ID,R_Row_Top3_ID,"
+            << "R_Row_Top1_TOPS,R_Row_Top2_TOPS,R_Row_Top3_TOPS,"
+            << "R_Col_MaxAlgID,R_Col_Top1_ID,R_Col_Top2_ID,R_Col_Top3_ID,"
+            << "R_Col_Top1_TOPS,R_Col_Top2_TOPS,R_Col_Top3_TOPS\n";
+        
+        // ============================================================
+        // 内层循环：遍历M值（外层），然后遍历layout配置（内层）
+        // 按M排序，相同M下按4种layout顺序排列
+        // ============================================================
+        for (int M : m_list) {
+            std::cout << "\n  ----------------------------------------" << std::endl;
+            std::cout << "  测试 M=" << M << ", N=" << N << ", K=" << K << std::endl;
+            std::cout << "  ----------------------------------------" << std::endl;
+            
+            // 遍历4种layout配置
+            for (const auto& config : configs) {
+                std::cout << "\n    测试Layout: " << config.name << std::endl;
+                std::cout << "      opW=" << getOpName(config.opW)
+                          << ", opA=" << getOpName(config.opA)
+                          << ", orderW=" << getOrderName(config.orderW)
+                          << ", orderA=" << getOrderName(config.orderA) << std::endl;
 
-    // CSV表头
-    csv << "Layout,N,K,M,"
-        << "R_Row_MaxAlgID,R_Row_Top1_ID,R_Row_Top2_ID,R_Row_Top3_ID,"
-        << "R_Row_Top1_TOPS,R_Row_Top2_TOPS,R_Row_Top3_TOPS,"
-        << "R_Col_MaxAlgID,R_Col_Top1_ID,R_Col_Top2_ID,R_Col_Top3_ID,"
-        << "R_Col_Top1_TOPS,R_Col_Top2_TOPS,R_Col_Top3_TOPS\n";
+                std::vector<AlgResult> results_row, results_col;
+                bool row_valid = false, col_valid = false;
+                int max_alg_id_row = -1, max_alg_id_col = -1;
 
-    // 遍历所有NK组合
-    for (const auto &nk : nk_pairs) {
-        int N = nk.first;
-        int K = nk.second;
+                // 测试R=Row布局
+                std::cout << "\n      测试 R=Row 布局..." << std::endl;
+                int ret_row = testLayoutConfig(
+                    config, CUSPARSE_ORDER_ROW, M, N, K, num_runs, start, stop, results_row, max_alg_id_row);
 
-        std::cout << "\n========================================" << std::endl;
-        std::cout << "测试维度: M=" << M << ", N=" << N << ", K=" << K << std::endl;
-        std::cout << "========================================" << std::endl;
-
-        // 遍历所有layout配置
-        for (const auto& config : configs) {
-            std::cout << "\n测试Layout: " << config.name
-                      << (config.isPrimary ? " (主要)" : " (次要)") << std::endl;
-            std::cout << "  opW=" << getOpName(config.opW)
-                      << ", opA=" << getOpName(config.opA)
-                      << ", orderW=" << getOrderName(config.orderW)
-                      << ", orderA=" << getOrderName(config.orderA) << std::endl;
-
-            std::vector<AlgResult> results_row, results_col;
-            bool row_valid = false, col_valid = false;
-            int max_alg_id_row = -1, max_alg_id_col = -1;  // 最大算法ID
-
-            // 测试R=Row布局
-            std::cout << "\n  测试 R=Row 布局..." << std::endl;
-            int ret_row = testLayoutConfig(
-                config, CUSPARSE_ORDER_ROW, M, N, K, num_runs, start, stop, results_row, max_alg_id_row);
-
-            if (ret_row == 0 && !results_row.empty()) {
-                row_valid = true;
-                std::cout << "    R=Row 有效，共 " << results_row.size() << " 个算法" << std::endl;
-                int show_count = std::min(3, static_cast<int>(results_row.size()));
-                for (int i = 0; i < show_count; ++i) {
-                    std::cout << "      Top" << (i+1) << ": AlgID=" << results_row[i].alg_id
-                              << ", " << results_row[i].throughput << " TOPS" << std::endl;
+                if (ret_row == 0 && !results_row.empty()) {
+                    row_valid = true;
+                    std::cout << "        R=Row 有效，共 " << results_row.size() << " 个算法" << std::endl;
+                    int show_count = std::min(3, static_cast<int>(results_row.size()));
+                    for (int i = 0; i < show_count; ++i) {
+                        std::cout << "          Top" << (i+1) << ": AlgID=" << results_row[i].alg_id
+                                  << ", " << results_row[i].throughput << " TOPS" << std::endl;
+                    }
+                } else if (ret_row == 10) {
+                    std::cout << "        R=Row 操作不支持 (错误代码10)，跳过" << std::endl;
+                } else {
+                    std::cout << "        R=Row 测试失败或无有效算法" << std::endl;
                 }
-            } else if (ret_row == 10) {
-                std::cout << "    R=Row 操作不支持 (错误代码10)，跳过" << std::endl;
-            } else {
-                std::cout << "    R=Row 测试失败或无有效算法" << std::endl;
-            }
 
-            // 测试R=Col布局
-            std::cout << "\n  测试 R=Col 布局..." << std::endl;
-            int ret_col = testLayoutConfig(
-                config, CUSPARSE_ORDER_COL, M, N, K, num_runs, start, stop, results_col, max_alg_id_col);
+                // 测试R=Col布局
+                std::cout << "\n      测试 R=Col 布局..." << std::endl;
+                int ret_col = testLayoutConfig(
+                    config, CUSPARSE_ORDER_COL, M, N, K, num_runs, start, stop, results_col, max_alg_id_col);
 
-            if (ret_col == 0 && !results_col.empty()) {
-                col_valid = true;
-                std::cout << "    R=Col 有效，共 " << results_col.size() << " 个算法" << std::endl;
-                int show_count = std::min(3, static_cast<int>(results_col.size()));
-                for (int i = 0; i < show_count; ++i) {
-                    std::cout << "      Top" << (i+1) << ": AlgID=" << results_col[i].alg_id
-                              << ", " << results_col[i].throughput << " TOPS" << std::endl;
+                if (ret_col == 0 && !results_col.empty()) {
+                    col_valid = true;
+                    std::cout << "        R=Col 有效，共 " << results_col.size() << " 个算法" << std::endl;
+                    int show_count = std::min(3, static_cast<int>(results_col.size()));
+                    for (int i = 0; i < show_count; ++i) {
+                        std::cout << "          Top" << (i+1) << ": AlgID=" << results_col[i].alg_id
+                                  << ", " << results_col[i].throughput << " TOPS" << std::endl;
+                    }
+                } else if (ret_col == 10) {
+                    std::cout << "        R=Col 操作不支持 (错误代码10)，跳过" << std::endl;
+                } else {
+                    std::cout << "        R=Col 测试失败或无有效算法" << std::endl;
                 }
-            } else if (ret_col == 10) {
-                std::cout << "    R=Col 操作不支持 (错误代码10)，跳过" << std::endl;
-            } else {
-                std::cout << "    R=Col 测试失败或无有效算法" << std::endl;
-            }
 
-            // 只有至少一个有效时才写入CSV
-            if (row_valid || col_valid) {
-                csv << config.name << "," << N << "," << K << "," << M << ",";
+                // 写入CSV（即使无效也写入，用-1和0表示）
+                csv << M << "," << config.name << "," << N << "," << K << ",";
 
                 // R=Row的MaxAlgID和Top3
                 if (row_valid) {
-                    csv << max_alg_id_row << ",";  // 输出最大算法ID
+                    csv << max_alg_id_row << ",";
                     for (int i = 0; i < 3; ++i) {
                         if (i < static_cast<int>(results_row.size())) {
                             csv << results_row[i].alg_id;
@@ -663,12 +780,12 @@ int main() {
                         csv << ",";
                     }
                 } else {
-                    csv << "-1,-1,-1,-1,0,0,0,";  // 包含MaxAlgID=-1
+                    csv << "-1,-1,-1,-1,0,0,0,";
                 }
 
                 // R=Col的MaxAlgID和Top3
                 if (col_valid) {
-                    csv << max_alg_id_col << ",";  // 输出最大算法ID
+                    csv << max_alg_id_col << ",";
                     for (int i = 0; i < 3; ++i) {
                         if (i < static_cast<int>(results_col.size())) {
                             csv << results_col[i].alg_id;
@@ -686,14 +803,15 @@ int main() {
                         if (i < 2) csv << ",";
                     }
                 } else {
-                    csv << "-1,-1,-1,-1,0,0,0";  // 包含MaxAlgID=-1
+                    csv << "-1,-1,-1,-1,0,0,0";
                 }
 
                 csv << "\n";
-            } else {
-                std::cout << "  该Layout配置完全不支持，不写入CSV" << std::endl;
             }
         }
+        
+        csv.close();
+        std::cout << "\n  CSV文件已写入: " << csvPath << std::endl;
     }
 
     CHECK_CUDA_MAIN(cudaEventDestroy(start));
@@ -705,7 +823,9 @@ int main() {
     }
 
     std::cout << "\n========================================" << std::endl;
-    std::cout << "测试完成，结果已写入 " << kCsvFileName << std::endl;
+    std::cout << "全部测试完成!" << std::endl;
+    std::cout << "输出目录: " << outputDir << std::endl;
+    std::cout << "生成CSV文件数: " << total_nk << std::endl;
     std::cout << "========================================" << std::endl;
 
     return EXIT_SUCCESS;
