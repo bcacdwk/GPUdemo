@@ -1,9 +1,9 @@
 /*
-稀疏在右：自动遍历所有算法ID并记录性能，虽然我们推理用的是稀疏在左+NT，也就是 [N,K][K,M]= [N,M]
-但是，Kernel测试为了变量命名一致，所以稀疏放到右边+NT，但是速度是一样的
-nvcc -o sparse_R_search_all sparse_R_search_all.cu -lcusparseLt && ./sparse_R_search_all
+稀疏在左：自动遍历所有算法ID并记录性能
+nvcc -o W_left_A_right_all W_left_A_right_all.cu -lcusparseLt && ./W_left_A_right_all
 */
-const char* kCsvFileName = "R_NT_RR_C_smallM.csv"; // 可修改的结果文件名
+const char* kCsvFileName = "L_NT_RR_R_smallM.csv"; // 可修改的结果文件名
+// 实际计算逻辑: R[N,M] = W[N,K] * A^T[M,K]，其中 W 是稀疏矩阵，A 是稠密矩阵
 
 #include <cuda_runtime_api.h>
 #include <cusparseLt.h>
@@ -68,12 +68,16 @@ struct cusparse_compute_type<int> {
 int main() {
 	std::srand(static_cast<unsigned>(time(nullptr)));
 
-	//这里执行的相当于是 R[M,N] = A[M,K] * W^T[N,K]，即稀疏矩阵在右侧+NT，Row-Row主序
-	//因为cusparselt要求denseA维度是16倍数；而sparseW维度是32倍数的，因此m必须是16的倍数
-	
-	//std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
-	std::vector<int> m_values = {16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256};
+	// 实际计算逻辑: R[N,M] = W[N,K] * A^T[M,K]
+	// W: 稀疏矩阵 [N,K]，A: 稠密矩阵 [M,K]（转置后参与运算）
+	// 稀疏矩阵在左侧 + NT模式，Row-Row主序
+	// cusparseLt要求: dense矩阵维度是16倍数，sparse矩阵维度是32倍数，因此 N 必须是32的倍数
 
+	// M values: 稠密矩阵 A 的行数（也是结果矩阵的列数）
+	//std::vector<int> m_values = {256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
+	std::vector<int> m_values = {32, 64, 96, 128, 160, 192, 224, 256};
+
+	// (N, K) pairs: N 是稀疏矩阵 W 的行数（结果矩阵的行数），K 是共享维度
 	std::vector<std::pair<int, int>> nk_pairs = {
 		{2560, 2560},
 		{3840, 2560},
@@ -81,7 +85,7 @@ int main() {
 		{2560, 6912}
 	};
 
-	const int num_runs = 100;
+	const int num_runs = 10;
 
 	cudaEvent_t start, stop;
 	CHECK_CUDA(cudaEventCreate(&start));
@@ -100,8 +104,12 @@ int main() {
 		for (const auto &nk : nk_pairs) {
 			int n = nk.first;
 			int k = nk.second;
+			// R[N,M] = W[N,K] * A^T[M,K]
+			// 这里 m 是 dense A 的行数，n 是 sparse W 的行数
 
-			std::cout << "正在测试矩阵维度: M=" << m << ", N=" << n << ", K=" << k << std::endl;
+			std::cout << "正在测试矩阵维度: M=" << m << ", N=" << n << ", K=" << k 
+				  << " (R[" << n << "," << m << "] = W[" << n << "," << k 
+				  << "] * A^T[" << m << "," << k << "])" << std::endl;
 
 			size_t free_mem = 0, total_mem = 0;
 			CHECK_CUDA(cudaMemGetInfo(&free_mem, &total_mem));
@@ -111,7 +119,7 @@ int main() {
 			//CUSPARSE_OPERATION_NON_TRANSPOSE; CUSPARSE_OPERATION_TRANSPOSE
 			auto orderA        = CUSPARSE_ORDER_ROW;
 			auto orderB        = CUSPARSE_ORDER_ROW;
-			auto orderC        = CUSPARSE_ORDER_COL;
+			auto orderC        = CUSPARSE_ORDER_ROW;
 			auto opA           = CUSPARSE_OPERATION_NON_TRANSPOSE;
 			auto opB           = CUSPARSE_OPERATION_TRANSPOSE;
 			auto type_AB       = cuda_type<AB_t>::value;
@@ -125,12 +133,15 @@ int main() {
 			bool isA_transposed = (opA != CUSPARSE_OPERATION_NON_TRANSPOSE);
 			bool isB_transposed = (opB != CUSPARSE_OPERATION_NON_TRANSPOSE);
 
-			int num_A_rows = isA_transposed ? k : m;
-			int num_A_cols = isA_transposed ? m : k;
-			int num_B_rows = isB_transposed ? n : k;
-			int num_B_cols = isB_transposed ? k : n;
-			int num_C_rows = m;
-			int num_C_cols = n;
+			// 对于 R[N,M] = W[N,K] * A^T[M,K]:
+			// matA (sparse W): [N,K], matB (dense A): 逻辑上 [M,K] 但以转置形式参与
+			// matC (result R): [N,M]
+			int num_A_rows = isA_transposed ? k : n;  // sparse W: N rows
+			int num_A_cols = isA_transposed ? n : k;  // sparse W: K cols
+			int num_B_rows = isB_transposed ? m : k;  // dense A^T: M rows (transposed)
+			int num_B_cols = isB_transposed ? k : m;  // dense A^T: K cols (transposed)
+			int num_C_rows = n;  // result R: N rows
+			int num_C_cols = m;  // result R: M cols
 
 			int lda = isA_rowmajor ? num_A_cols : num_A_rows;
 			int ldb = isB_rowmajor ? num_B_cols : num_B_rows;
@@ -152,10 +163,12 @@ int main() {
 			std::vector<AB_t> hB(B_elems);
 			std::vector<C_t>  hC(C_elems, static_cast<C_t>(0));
 
-			for (size_t i = 0; i < static_cast<size_t>(m) * k; ++i) {
+			// 初始化 sparse W [N,K]
+			for (size_t i = 0; i < static_cast<size_t>(n) * k; ++i) {
 				hA[i] = static_cast<AB_t>(std::rand() % 256 - 128);
 			}
-			for (size_t i = 0; i < static_cast<size_t>(k) * n; ++i) {
+			// 初始化 dense A [M,K]
+			for (size_t i = 0; i < static_cast<size_t>(m) * k; ++i) {
 				hB[i] = static_cast<AB_t>(std::rand() % 256 - 128);
 			}
 
@@ -184,15 +197,15 @@ int main() {
 
 			CHECK_CUSPARSE(cusparseLtInit(&handle));
 
-			CHECK_CUSPARSE(cusparseLtDenseDescriptorInit(&handle, &matA,
-						  num_A_rows, num_A_cols,
-						  lda, alignment, type_AB,
-						  orderA));
+			CHECK_CUSPARSE(cusparseLtStructuredDescriptorInit(&handle, &matA,
+															   num_A_rows, num_A_cols,
+															   lda, alignment, type_AB,
+															   orderA, CUSPARSELT_SPARSITY_50_PERCENT));
 
-			CHECK_CUSPARSE(cusparseLtStructuredDescriptorInit(&handle, &matB,
-						   num_B_rows, num_B_cols,
-						   ldb, alignment, type_AB,
-						   orderB, CUSPARSELT_SPARSITY_50_PERCENT));
+			CHECK_CUSPARSE(cusparseLtDenseDescriptorInit(&handle, &matB,
+														  num_B_rows, num_B_cols,
+														  ldb, alignment, type_AB,
+														  orderB));
 
 			CHECK_CUSPARSE(cusparseLtDenseDescriptorInit(&handle, &matC,
 														  num_C_rows, num_C_cols,
@@ -204,13 +217,13 @@ int main() {
 														   &matC, &matC, compute_type));
 
 			CHECK_CUSPARSE(cusparseLtMatmulDescSetAttribute(&handle, &matmul,
-						 CUSPARSELT_MATMUL_SPARSE_MAT_POINTER,
-						 &dB, sizeof(dB)));
+															 CUSPARSELT_MATMUL_SPARSE_MAT_POINTER,
+															 &dA, sizeof(dA)));
 
-			CHECK_CUSPARSE(cusparseLtSpMMAPrune(&handle, &matmul, dB, dB,
+			CHECK_CUSPARSE(cusparseLtSpMMAPrune(&handle, &matmul, dA, dA,
 												CUSPARSELT_PRUNE_SPMMA_TILE, stream));
 
-			CHECK_CUSPARSE(cusparseLtSpMMAPruneCheck(&handle, &matmul, dB,
+			CHECK_CUSPARSE(cusparseLtSpMMAPruneCheck(&handle, &matmul, dA,
 									  d_valid, stream));
 
 			int is_valid = 0;
@@ -265,8 +278,8 @@ int main() {
 			double throughput_alg_6 = 0.0;
 
 			for (int alg_id = 0; alg_id <= max_alg_id; ++alg_id) {
-				AB_t *dB_compressed_local = nullptr;
-				void *dB_compressedBuffer_local = nullptr;
+				AB_t *dA_compressed_local = nullptr;
+				void *dA_compressedBuffer_local = nullptr;
 				void *d_workspace_local = nullptr;
 				bool record_valid = true;
 				bool selection_created = false;
@@ -289,13 +302,13 @@ int main() {
 						cudaFree(d_workspace_local);
 						d_workspace_local = nullptr;
 					}
-					if (dB_compressedBuffer_local) {
-						cudaFree(dB_compressedBuffer_local);
-						dB_compressedBuffer_local = nullptr;
+					if (dA_compressedBuffer_local) {
+						cudaFree(dA_compressedBuffer_local);
+						dA_compressedBuffer_local = nullptr;
 					}
-					if (dB_compressed_local) {
-						cudaFree(dB_compressed_local);
-						dB_compressed_local = nullptr;
+					if (dA_compressed_local) {
+						cudaFree(dA_compressed_local);
+						dA_compressed_local = nullptr;
 					}
 					if (plan_created) {
 						cusparseLtMatmulPlanDestroy(&plan);
@@ -342,7 +355,7 @@ int main() {
 					continue;
 				}
 
-				cudaError_t cuda_status = cudaMalloc(reinterpret_cast<void **>(&dB_compressed_local), compressed_size);
+				cudaError_t cuda_status = cudaMalloc(reinterpret_cast<void **>(&dA_compressed_local), compressed_size);
 				if (cuda_status != cudaSuccess) {
 					std::cout << "算法ID " << alg_id << " 分配压缩矩阵失败: "
 						  << cudaGetErrorString(cuda_status) << std::endl;
@@ -352,7 +365,7 @@ int main() {
 				}
 
 				if (compressed_buffer_size > 0) {
-					cuda_status = cudaMalloc(&dB_compressedBuffer_local, compressed_buffer_size);
+					cuda_status = cudaMalloc(&dA_compressedBuffer_local, compressed_buffer_size);
 					if (cuda_status != cudaSuccess) {
 						std::cout << "算法ID " << alg_id << " 分配压缩缓冲区失败: "
 							  << cudaGetErrorString(cuda_status) << std::endl;
@@ -363,8 +376,8 @@ int main() {
 				}
 
 				cusparseStatus_t compress_status = cusparseLtSpMMACompress(
-					&handle, &plan, dB, dB_compressed_local,
-					dB_compressedBuffer_local, stream);
+					&handle, &plan, dA, dA_compressed_local,
+					dA_compressedBuffer_local, stream);
 				if (compress_status != CUSPARSE_STATUS_SUCCESS) {
 					std::cout << "算法ID " << alg_id << " 的稀疏矩阵压缩失败: "
 						  << cusparseLtGetErrorString(compress_status) << std::endl;
@@ -405,7 +418,7 @@ int main() {
 				}
 
 				cusparseStatus_t warmup_status = cusparseLtMatmul(
-					&handle, &plan, &alpha, dA, dB_compressed_local,
+					&handle, &plan, &alpha, dA_compressed_local, dB,
 					&beta, dC, dD, d_workspace_local, nullptr, 0);
 				if (warmup_status != CUSPARSE_STATUS_SUCCESS) {
 					std::cout << "算法ID " << alg_id << " 预热计算失败: "
@@ -436,7 +449,7 @@ int main() {
 					}
 
 					cusparseStatus_t compute_status = cusparseLtMatmul(
-						&handle, &plan, &alpha, dA, dB_compressed_local,
+						&handle, &plan, &alpha, dA_compressed_local, dB,
 						&beta, dC, dD, d_workspace_local, nullptr, 0);
 					if (compute_status != CUSPARSE_STATUS_SUCCESS) {
 						std::cout << "算法ID " << alg_id << " 第 " << run
@@ -529,6 +542,7 @@ int main() {
 					  << " 没有获得任何有效算法结果。" << std::endl;
 			}
 
+			// CSV 输出格式: M,N,K (实际计算 R[N,M] = W[N,K] * A^T[M,K])
 			std::ostringstream summary;
 			summary << m << ',' << n << ',' << k << ",BestID=";
 			if (best_alg_1 >= 0) {
