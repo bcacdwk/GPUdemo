@@ -8,7 +8,7 @@
   5. 输出兼容性矩阵：matrix[alg_i][weight_j] = 1 表示算法i可以使用权重j
 
 编译运行:
-nvcc -o W_left_A_right_compat W_left_A_right_compat.cu -lcusparseLt && ./W_left_A_right_compat
+nvcc -o alg_weight_id_compat alg_weight_id_compat.cu -lcusparseLt && ./alg_weight_id_compat
 */
 
 const char* kCsvFileName = "alg_weight_compat_matrix.csv";
