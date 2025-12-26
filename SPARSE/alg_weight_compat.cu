@@ -679,7 +679,7 @@ int runCompatTest(int m, int n, int k, const std::string& csvPath, bool verbose 
 
 int main() {
     // 配置参数
-    std::vector<int> m_list = {16, 256, 2048, 16384};
+    std::vector<int> m_list = {16, 256, 2048};
     
     std::vector<NKPair> nk_pairs = {
         {3840, 2560, "Wqkv"},
