@@ -16,7 +16,7 @@
   3. 比较所有golden之间的一致性
 
 编译运行:
-nvcc -o alg_weight_compat alg_weight_compat.cu -lcusparseLt && ./alg_weight_compat
+nvcc -o alg_weight_compat_NT_RR_C alg_weight_compat_NT_RR_C.cu -lcusparseLt && ./alg_weight_compat_NT_RR_C
 */
 
 #include <cuda_runtime_api.h>
@@ -162,7 +162,7 @@ int runCompatTest(int m, int n, int k, const std::string& csvPath, bool verbose 
     // 矩阵配置
     auto orderA        = CUSPARSE_ORDER_ROW;
     auto orderB        = CUSPARSE_ORDER_ROW;
-    auto orderC        = CUSPARSE_ORDER_ROW;
+    auto orderC        = CUSPARSE_ORDER_COL;
     auto opA           = CUSPARSE_OPERATION_NON_TRANSPOSE;
     auto opB           = CUSPARSE_OPERATION_TRANSPOSE;
     auto type_AB       = cuda_type<AB_t>::value;
@@ -179,7 +179,7 @@ int runCompatTest(int m, int n, int k, const std::string& csvPath, bool verbose 
 
     int lda = num_A_cols;
     int ldb = num_B_cols;
-    int ldc = num_C_cols;
+    int ldc = num_C_rows;
 
     size_t A_elems = static_cast<size_t>(n) * k;
     size_t B_elems = static_cast<size_t>(m) * k;
