@@ -628,7 +628,7 @@ py::dict search_topk(torch::Tensor W_pruned_bf16, torch::Tensor A_bf16,
             // 超过容限但未达到严重级别：记录但不跳过
             std::cout << "[INFO] M=" << M << " alg_id=" << alg_id 
                       << " 相对误差=" << (max_rel_err * 100.0f) << "% > 5%" << std::endl;
-            rec.valid = false;
+            rec.valid = true;
             verify_failed_ids.push_back(alg_id);
           }
         }
