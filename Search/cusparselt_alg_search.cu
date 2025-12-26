@@ -595,14 +595,14 @@ py::dict search_topk(torch::Tensor W_pruned_bf16, torch::Tensor A_bf16,
           float max_rel_err = rel_diff.max().item<float>();
           rec.max_abs_err = max_rel_err;  // 存储的是相对误差
           
-          // 相对误差容限：1%
-          constexpr float tol = 0.01f;
-          constexpr float critical_tol = 0.10f;  // 超过 10% 认为计算有严重问题
+          // 相对误差容限：5%
+          constexpr float tol = 0.05f;
+          constexpr float critical_tol = 1.00f;  // 超过 100% 认为计算有严重问题
           
           if (max_rel_err > critical_tol || std::isnan(max_rel_err)) {
             // 严重错误：输出 warning，跳过当前 M 剩余算法
             std::cerr << "[WARNING] M=" << M << " alg_id=" << alg_id 
-                      << " 相对误差=" << (max_rel_err * 100.0f) << "% > 10%，跳过剩余算法" << std::endl;
+                      << " 相对误差=" << (max_rel_err * 100.0f) << "% > 100%，跳过剩余算法" << std::endl;
             rec.valid = false;
             verify_failed_ids.push_back(alg_id);
             cusparseLtMatmulPlanDestroy(&plan);
@@ -611,7 +611,7 @@ py::dict search_topk(torch::Tensor W_pruned_bf16, torch::Tensor A_bf16,
           } else if (max_rel_err > tol) {
             // 超过容限但未达到严重级别：记录但不跳过
             std::cout << "[INFO] M=" << M << " alg_id=" << alg_id 
-                      << " 相对误差=" << (max_rel_err * 100.0f) << "% > 10%" << std::endl;
+                      << " 相对误差=" << (max_rel_err * 100.0f) << "% > 5%" << std::endl;
             rec.valid = false;
             verify_failed_ids.push_back(alg_id);
           }

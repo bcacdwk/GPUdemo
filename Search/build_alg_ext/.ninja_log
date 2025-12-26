@@ -1,3 +1,3 @@
 # ninja log v7
-0	40628	1766741106494224997	cusparselt_alg_search.cuda.o	8976f2dca85439f4
-40634	40871	1766741147128680121	cusparselt_alg_search_ext.so	8aa0e6a2775aa836
+0	38439	1766741871274706381	cusparselt_alg_search.cuda.o	6a0b14eaac0304c4
+38451	38689	1766741909726258162	cusparselt_alg_search_ext.so	8aa0e6a2775aa836
