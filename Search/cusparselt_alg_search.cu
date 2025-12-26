@@ -67,18 +67,19 @@ static LayoutConfig parse_layout(const std::string &layout) {
 static cudaDataType to_cuda_dtype(const std::string &dtype) {
   if (dtype == "int8") return CUDA_R_8I;
   if (dtype == "fp8e4m3") return CUDA_R_8F_E4M3;
-  throw std::invalid_argument("不支持的数据类型: " + dtype);
+  if (dtype == "fp8e5m2") return CUDA_R_8F_E5M2;
+  throw std::invalid_argument("不支持的数据类型: " + dtype + "。支持: int8, fp8e4m3, fp8e5m2");
 }
 
 static cudaDataType cuda_out_dtype(const std::string &dtype) {
   if (dtype == "int8") return CUDA_R_32I;
-  if (dtype == "fp8e4m3") return CUDA_R_32F;
+  if (dtype == "fp8e4m3" || dtype == "fp8e5m2") return CUDA_R_32F;
   throw std::invalid_argument("不支持的数据类型: " + dtype);
 }
 
 static cusparseComputeType compute_type_from_dtype(const std::string &dtype) {
   if (dtype == "int8") return CUSPARSE_COMPUTE_32I;
-  if (dtype == "fp8e4m3") return CUSPARSE_COMPUTE_32F;
+  if (dtype == "fp8e4m3" || dtype == "fp8e5m2") return CUSPARSE_COMPUTE_32F;
   throw std::invalid_argument("不支持的数据类型: " + dtype);
 }
 
@@ -91,15 +92,30 @@ static std::pair<torch::Tensor, double> quantize_int8(torch::Tensor x) {
 }
 
 // ===== FP8 转换 =====
-static torch::Tensor to_fp8(torch::Tensor x) {
+// FP8E4M3: 4位指数, 3位尾数, 动态范围小但精度高, 适合权重和激活
+// FP8E5M2: 5位指数, 2位尾数, 动态范围大但精度低, 适合梯度
+static torch::Tensor to_fp8_e4m3(torch::Tensor x) {
   if (!x.is_cuda()) throw std::runtime_error("FP8 转换需要 CUDA 张量");
-  // 尝试使用 PyTorch 2.1+ 的 FP8 类型
-  // 如果环境不支持，会在运行时抛出异常
   try {
     return x.to(torch::kFloat8_e4m3fn);
   } catch (...) {
     throw std::runtime_error("当前 PyTorch 版本不支持 FP8E4M3 类型，请升级到 PyTorch 2.1+");
   }
+}
+
+static torch::Tensor to_fp8_e5m2(torch::Tensor x) {
+  if (!x.is_cuda()) throw std::runtime_error("FP8 转换需要 CUDA 张量");
+  try {
+    return x.to(torch::kFloat8_e5m2);
+  } catch (...) {
+    throw std::runtime_error("当前 PyTorch 版本不支持 FP8E5M2 类型，请升级到 PyTorch 2.1+");
+  }
+}
+
+static torch::Tensor to_fp8(torch::Tensor x, const std::string &dtype) {
+  if (dtype == "fp8e4m3") return to_fp8_e4m3(x);
+  if (dtype == "fp8e5m2") return to_fp8_e5m2(x);
+  throw std::invalid_argument("未知的 FP8 子类型: " + dtype);
 }
 
 // ===== 计算维度辅助 =====
@@ -271,11 +287,11 @@ py::dict search_topk(torch::Tensor W_pruned_bf16, torch::Tensor A_bf16,
     auto qA = quantize_int8(A_fp);
     W_q = qW.first;
     A_q = qA.first;
-  } else if (dtype == "fp8e4m3") {
-    W_q = to_fp8(W_fp);
-    A_q = to_fp8(A_fp);
+  } else if (dtype == "fp8e4m3" || dtype == "fp8e5m2") {
+    W_q = to_fp8(W_fp, dtype);
+    A_q = to_fp8(A_fp, dtype);
   } else {
-    throw std::invalid_argument("不支持的数据类型: " + dtype);
+    throw std::invalid_argument("不支持的数据类型: " + dtype + "。支持: int8, fp8e4m3, fp8e5m2");
   }
 
   // 获取最大 M 用于压缩计划

@@ -22,6 +22,7 @@ cuSPARSELt 算法离线搜索 v1.0
 运行示例:
 CUDA_VISIBLE_DEVICES=0 python run_alg_search.py --dtype int8 --layout auto --verify --compile
 CUDA_VISIBLE_DEVICES=0 python run_alg_search.py --dtype fp8e4m3 --layout auto --verify --compile
+CUDA_VISIBLE_DEVICES=0 python run_alg_search.py --dtype fp8e5m2 --layout auto --verify --compile
 
 """
 
@@ -128,15 +129,22 @@ def ensure_cusparselt_loaded() -> None:
         "无法找到兼容的 libcusparseLt，请设置 CUSPARSELT_PATH 或安装 CUDA 12.9+。"
     )
 
-# === 扩展编译/加载 ===
+# === 扩展编译/加载（跨架构支持）===
+
 
 def load_extension(verbose: bool = True, force_compile: bool = False) -> object:
     """
-    加载 CUDA 扩展。
+    加载 CUDA 扩展（支持跨架构）。
+    
+    根据当前 GPU 架构加载或编译对应的 .so 文件。
+    不同架构的 .so 文件可以在同一目录共存：
+    - cusparselt_alg_search_ampere.so
+    - cusparselt_alg_search_hopper.so
+    - cusparselt_alg_search_blackwell.so
     
     Args:
         verbose: 是否显示进度信息
-        force_compile: 是否强制重新编译。默认 False 将复用已有 .so
+        force_compile: 是否强制重新编译当前架构
     
     Returns:
         编译好的扩展模块
@@ -147,76 +155,90 @@ def load_extension(verbose: bool = True, force_compile: bool = False) -> object:
     if verbose:
         print("✓", flush=True)
     
+    # 获取架构相关信息
+    arch_name, arch_suffix, sm_code = detect_arch()
+    ext_name = f"cusparselt_alg_search_{arch_suffix}"
+    so_pattern = f"{ext_name}*.so"
+    
     src_path = Path(__file__).parent / "cusparselt_alg_search.cu"
     build_dir = Path(__file__).parent / "build_alg_ext"
     build_dir.mkdir(parents=True, exist_ok=True)
     
-    # 检查是否已有编译好的 .so
-    so_pattern = build_dir / "cusparselt_alg_search_ext*.so"
-    existing_so = list(build_dir.glob("cusparselt_alg_search_ext*.so"))
+    # 检查当前架构的 .so 是否存在且比源文件新
+    existing_so = list(build_dir.glob(so_pattern))
+    need_compile = force_compile
+    if not need_compile:
+        if not existing_so:
+            need_compile = True
+        else:
+            # 源文件比 .so 新则需要重编译
+            need_compile = src_path.stat().st_mtime > existing_so[0].stat().st_mtime
     
-    if not force_compile and existing_so:
+    if not need_compile and existing_so:
         # 直接加载已有的 .so
         if verbose:
-            print(f"[2/4] 加载已编译的扩展...", end=" ", flush=True)
+            print(f"[2/4] 加载 {arch_suffix} 扩展...", end=" ", flush=True)
         import importlib.util
-        so_file = existing_so[0]
-        spec = importlib.util.spec_from_file_location("cusparselt_alg_search_ext", str(so_file))
+        spec = importlib.util.spec_from_file_location(ext_name, str(existing_so[0]))
         ext = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(ext)
         if verbose:
-            print(f"✓ ({so_file.name})", flush=True)
+            print(f"✓ ({existing_so[0].name})", flush=True)
         return ext
     else:
-        # 需要编译
-        if force_compile and existing_so:
-            if verbose:
-                print("[2/4] 强制重新编译 CUDA 扩展...", end=" ", flush=True)
-            # 删除旧的 .so 和编译缓存
-            import shutil
-            shutil.rmtree(build_dir)
-            build_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            if verbose:
-                print("[2/4] 编译 CUDA 扩展...", end=" ", flush=True)
+        # 编译（torch.utils.cpp_extension.load 会自动覆盖旧文件）
+        if verbose:
+            reason = "强制" if force_compile else ("首次" if not existing_so else "源文件已更新")
+            print(f"[2/4] 编译 {arch_suffix} 扩展（{reason}）...", end=" ", flush=True)
         
         ext = load(
-            name="cusparselt_alg_search_ext",
+            name=ext_name,
             sources=[str(src_path)],
-            extra_cuda_cflags=["-O3"],
-            # cuSPARSELt 可能需要 nvrtc 和 dl 库（某些发行版/静态链接场景）
+            extra_cuda_cflags=["-O3", f"-arch={sm_code}"],
             extra_ldflags=["-lcusparseLt", "-lnvrtc", "-ldl"],
             verbose=False,
             build_directory=str(build_dir),
             with_cuda=True,
         )
+        
+        # 清理编译中间文件，只保留 .so
+        for pattern in [".ninja_deps", ".ninja_log", "build.ninja", "*.o"]:
+            for f in build_dir.glob(pattern):
+                f.unlink(missing_ok=True)
+        
         if verbose:
             print("✓", flush=True)
         return ext
 
 # === 架构检测 ===
 
-def detect_arch() -> Tuple[str, int]:
+# 架构名称映射：compute capability major -> (arch_name, arch_suffix)
+ARCH_INFO = {
+    8: ("Ampere", "ampere"),      # A100, A10, A30 等
+    9: ("Hopper", "hopper"),      # H100, H200 等
+    10: ("Blackwell", "blackwell"),  # B100, B200 等
+}
+
+def detect_arch() -> Tuple[str, str, str]:
     """
     检测 GPU 架构。
     
     返回:
-        (arch_name, arch_id) 其中:
-        - arch_name: "Ampere", "Hopper", "Blackwell" 等
-        - arch_id: 0=Ampere, 1=Hopper, 2=Blackwell, 99=未知
-    
-    注意: torch.utils.cpp_extension.load 会自动检测 GPU 架构并选择合适的
-    编译参数（-arch=sm_xx），无需手动指定。
+        (arch_name, arch_suffix, sm_code) 其中:
+        - arch_name: "Ampere", "Hopper", "Blackwell" 等（用于显示）
+        - arch_suffix: "ampere", "hopper", "blackwell" 等（用于文件命名）
+        - sm_code: "sm_80", "sm_90" 等（用于 nvcc 编译）
     """
     prop = torch.cuda.get_device_properties(0)
-    cc = (prop.major, prop.minor)
-    if prop.major == 8:
-        return "Ampere", 0
-    if prop.major == 9:
-        return "Hopper", 1
-    if prop.major >= 10:
-        return "Blackwell", 2
-    return f"SM{prop.major}{prop.minor}", 99
+    major = prop.major
+    sm_code = f"sm_{major}{prop.minor}"
+    
+    if major in ARCH_INFO:
+        name, suffix = ARCH_INFO[major]
+        return name, suffix, sm_code
+    
+    # 未知架构
+    return f"SM{major}{prop.minor}", f"sm{major}{prop.minor}", sm_code
 
 # === 默认 NK/M 列表 ===
 
@@ -292,26 +314,18 @@ def lookup_best_alg(json_data: Dict, N: int, K: int, M: int) -> Optional[int]:
 # === 运行一次 layout 的搜索 ===
 
 def run_layout(ext, layout: str, dtype: str, nk_list: List[Tuple[int, int]], m_list: List[int],
-               warmup: int, repeat: int, verify: bool, arch_id: int, verbose: bool = True) -> Dict:
+               warmup: int, repeat: int, verify: bool, cc_major: int, verbose: bool = True) -> Dict:
     """
     运行一次 layout 配置的算法搜索。
     
     注意：
     - A100 的 NTRRrow 布局需要屏蔽某些算法 ID
-    - FP8 在 A100 上不支持，需要提前拦截
-    - 每个 NK 组合生成新的随机数据（显存优化在 v2.0 实现）
+    - 每个 NK 组合生成新的随机数据
     """
-    # === FP8 在 A100 上的防御 ===
-    # A100 (Ampere, arch_id=0) 硬件不支持 FP8 Tensor Core
-    if arch_id == 0 and dtype == "fp8e4m3":
-        raise ValueError(
-            f"FP8E4M3 不支持在 A100 (Ampere) 上运行。"
-            f"A100 仅支持 INT8。请使用 --dtype int8"
-        )
-    
     results = []
     max_M = max(m_list)
-    blacklist = [0, 1, 2, 3, 4] if (arch_id == 0 and layout == "NTRRrow") else []
+    # Ampere (CC 8.x) 的 NTRRrow 布局需要屏蔽某些算法
+    blacklist = [0, 1, 2, 3, 4] if (cc_major == 8 and layout == "NTRRrow") else []
     total_nk = len(nk_list)
 
     for nk_id, (N, K) in enumerate(nk_list):
@@ -372,7 +386,7 @@ def run_layout(ext, layout: str, dtype: str, nk_list: List[Tuple[int, int]], m_l
 
 # === 落盘工具 ===
 
-def save_outputs(out_dir: Path, arch_name: str, arch_id: int, layout: str, dtype: str,
+def save_outputs(out_dir: Path, arch_name: str, layout: str, dtype: str,
                  search_ret: Dict, warmup: int, repeat: int, verify: bool) -> None:
     """
     保存搜索结果到 CSV 和 JSON 文件。
@@ -384,10 +398,9 @@ def save_outputs(out_dir: Path, arch_name: str, arch_id: int, layout: str, dtype
     2. 在 nk_entry 的 m_thresholds 中找到 <= 目标 M 的最大阈值，使用其 best_alg_id
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / f"{arch_name}_{arch_id}_{layout}_{dtype.upper()}.csv"
-    json_path = csv_path.with_suffix(".json")
-
     prop = torch.cuda.get_device_properties(0)
+    csv_path = out_dir / f"{arch_name}_cc{prop.major}{prop.minor}_{layout}_{dtype.upper()}.csv"
+    json_path = csv_path.with_suffix(".json")
     
     # 获取 CUDA 版本信息
     cuda_driver_ver = get_nvidia_smi_cuda_version()  # nvidia-smi 显示的 CUDA 版本
@@ -397,15 +410,14 @@ def save_outputs(out_dir: Path, arch_name: str, arch_id: int, layout: str, dtype
         "gpu_name": prop.name,
         "compute_capability": f"{prop.major}.{prop.minor}",
         "arch_name": arch_name,
-        "arch_id": arch_id,
         "layout": layout,
         "dtype": dtype,
         "warmup": warmup,
         "repeat": repeat,
         "verify": verify,
         "torch_version": torch.__version__,
-        "cuda_version_driver": cuda_driver_ver,      # nvidia-smi 显示的版本，驱动支持的最高CUDA
-        "cuda_version_runtime": cuda_runtime_ver,    # PyTorch编译时使用的CUDA toolkit版本
+        "cuda_version_driver": cuda_driver_ver,
+        "cuda_version_runtime": cuda_runtime_ver,
         "time": datetime.datetime.now().isoformat(),
         "M_list": search_ret["M_list"],
         "NK_list": search_ret["NK_list"],
@@ -519,22 +531,57 @@ def save_outputs(out_dir: Path, arch_name: str, arch_id: int, layout: str, dtype
     print(f"已生成: {csv_path}")
     print(f"已生成: {json_path}")
 
+# === dtype 与架构兼容性检查 ===
+
+# 支持的 dtype 列表
+SUPPORTED_DTYPES = ["int8", "fp8e4m3", "fp8e5m2"]
+
+# 各架构支持的 dtype（key 为 compute capability major）
+DTYPE_SUPPORT = {
+    8: ["int8"],                          # Ampere (A100) 只支持 INT8
+    9: ["int8", "fp8e4m3", "fp8e5m2"],    # Hopper (H100) 支持 INT8 和 FP8
+    10: ["int8", "fp8e4m3", "fp8e5m2"],   # Blackwell 支持 INT8 和 FP8
+}
+
+def check_dtype_compatibility(dtype: str, cc_major: int, arch_name: str) -> None:
+    """
+    检查 dtype 与 GPU 架构的兼容性。
+    
+    如果不兼容，抛出 ValueError 并给出详细提示。
+    应在编译扩展之前调用，避免用户等待编译后才发现不支持。
+    """
+    if dtype not in SUPPORTED_DTYPES:
+        raise ValueError(
+            f"不支持的数据类型: {dtype}\n"
+            f"支持的类型: {', '.join(SUPPORTED_DTYPES)}"
+        )
+    
+    supported = DTYPE_SUPPORT.get(cc_major, ["int8"])  # 未知架构默认只支持 INT8
+    if dtype not in supported:
+        raise ValueError(
+            f"数据类型 {dtype.upper()} 不支持在 {arch_name} (CC {cc_major}.x) 上运行。\n"
+            f"该架构支持的数据类型: {', '.join(supported)}\n"
+            f"请使用 --dtype {supported[0]}"
+        )
+
+
 # === 主流程 ===
 
 def parse_args():
     p = argparse.ArgumentParser(description="cuSPARSELt 算法离线搜索 v1.0")
-    p.add_argument("--dtype", default="int8", choices=["int8", "fp8e4m3"], help="数据类型")
+    p.add_argument("--dtype", default="int8", choices=SUPPORTED_DTYPES, help="数据类型")
     p.add_argument("--layout", default="auto", choices=["auto", "NTRRcol", "NTRRrow"], help="布局")
     p.add_argument("--warmup", type=int, default=25)
     p.add_argument("--repeat", type=int, default=100)
     p.add_argument("--verify", action="store_true", help="开启正确性校验")
-    p.add_argument("--compile", action="store_true", help="强制重新编译 CUDA 扩展（默认复用已有 .so）")
+    p.add_argument("--compile", action="store_true", help="强制重新编译当前架构的 CUDA 扩展")
     p.add_argument("--out_dir", default=None, help="输出目录，默认 ./alg_search_results/<timestamp>")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    
     if not torch.cuda.is_available():
         raise RuntimeError("需要 CUDA 环境")
 
@@ -543,19 +590,31 @@ def main():
     print("cuSPARSELt 算法离线搜索 v1.0")
     print("="*60)
     
-    arch_name, arch_id = detect_arch()
+    arch_name, arch_suffix, sm_code = detect_arch()
     prop = torch.cuda.get_device_properties(0)
+    cc_major = prop.major
     print(f"GPU: {prop.name} (CC {prop.major}.{prop.minor}, {arch_name})")
     print(f"参数: dtype={args.dtype}, layout={args.layout}, warmup={args.warmup}, repeat={args.repeat}")
     if args.verify:
         print("注意: 已开启 verify 模式，会降低搜索速度")
     print()
 
+    # === 提前检查 dtype 兼容性（在编译扩展之前）===
+    try:
+        check_dtype_compatibility(args.dtype, cc_major, arch_name)
+    except ValueError as e:
+        print(f"\n❌ 错误: {e}")
+        print("")
+        return
+    
+    print(f"✓ dtype={args.dtype} 与 {arch_name} 架构兼容")
+    print()
+
     # 选择 layout 组合
     layout_list = []
     if args.layout == "auto":
         layout_list.append("NTRRcol")
-        if arch_id == 0:
+        if cc_major == 8:  # Ampere
             layout_list.append("NTRRrow")
     else:
         layout_list.append(args.layout)
@@ -583,13 +642,12 @@ def main():
             args.warmup,
             args.repeat,
             args.verify,
-            arch_id,
+            cc_major,
             verbose=True,
         )
         save_outputs(
             out_dir,
             arch_name,
-            arch_id,
             layout,
             args.dtype,
             ret,
