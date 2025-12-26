@@ -21,8 +21,8 @@ cuSPARSELt 算法离线搜索 v1.0
 
 运行示例:
 CUDA_VISIBLE_DEVICES=0 python run_alg_search.py --dtype int8 --layout auto --verify --compile
-CUDA_VISIBLE_DEVICES=0 python run_alg_search.py --dtype fp8e4m3 --layout auto --verify --compile
-CUDA_VISIBLE_DEVICES=0 python run_alg_search.py --dtype fp8e5m2 --layout auto --verify --compile
+CUDA_VISIBLE_DEVICES=0 python run_alg_search.py --dtype fp8e4m3 --layout auto --verify
+CUDA_VISIBLE_DEVICES=0 python run_alg_search.py --dtype fp8e5m2 --layout auto --verify
 
 """
 
