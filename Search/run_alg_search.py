@@ -5,14 +5,12 @@ cuSPARSELt 算法离线搜索 v1.0
 
 架构说明：
 =========
-本工具采用 pybind11 扩展方式，而非 subprocess 调用：
 - Python 端：负责外层 NK 循环、参数解析、GPU 检测、数据生成、结果落盘
 - C++ 端：负责内层 M 循环、算法枚举、cuSPARSELt API 调用、精确计时
 
-分工合理性：
 1. Python 控制外层 NK 循环，方便做进度条、异常捕获、断点续跑
 2. C++ 控制内层 M 循环和算法枚举，避免跨进程通信开销
-3. JSON 完全在 Python 端生成，避免 C++ 端的 JSON 处理脆弱性
+3. JSON 在 Python 端生成
 4. torch.utils.cpp_extension.load 自动检测 GPU 架构，无需手动指定 -arch
 
 显存优化：
