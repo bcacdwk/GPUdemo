@@ -327,31 +327,19 @@ py::dict search_topk(torch::Tensor W_pruned_bf16, torch::Tensor A_bf16,
 
   // === 找到最大有效 alg_id，用于压缩权重 ===
   // 关键：必须通过 planInit 成功来验证算法ID有效性
-  // CUSPARSELT_MATMUL_ALG_CONFIG_MAX_ID 只是理论上界，不保证对当前配置有效
+  // 策略：从 id=0 开始递增遍历，连续失败超过阈值则停止
   int max_alg_id = 0;
   {
-    // 先获取理论最大值作为探测上界
-    int theoretical_max = 108;  // 默认上界
-    cusparseLtMatmulAlgSelection_t alg_sel_tmp;
-    if (cusparseLtMatmulAlgSelectionInit(&handle, &alg_sel_tmp, &matmul_desc,
-                                         CUSPARSELT_MATMUL_ALG_DEFAULT) ==
-        CUSPARSE_STATUS_SUCCESS) {
-      int tmp_max = -1;
-      if (cusparseLtMatmulAlgGetAttribute(&handle, &alg_sel_tmp,
-                                          CUSPARSELT_MATMUL_ALG_CONFIG_MAX_ID,
-                                          &tmp_max, sizeof(tmp_max)) ==
-          CUSPARSE_STATUS_SUCCESS && tmp_max >= 0) {
-        theoretical_max = tmp_max;
-      }
-      cusparseLtMatmulAlgSelectionDestroy(&alg_sel_tmp);
-    }
-
-    // 遍历 [0, theoretical_max]，找到最大的有效算法ID（以 planInit 成功为准）
-    for (int probe = 0; probe <= theoretical_max; ++probe) {
+    constexpr int kMaxConsecutiveFailures = 3;  // 连续失败阈值
+    int consecutive_failures = 0;
+    
+    for (int probe = 0; ; ++probe) {
       cusparseLtMatmulAlgSelection_t sel;
       if (cusparseLtMatmulAlgSelectionInit(&handle, &sel, &matmul_desc,
                                            CUSPARSELT_MATMUL_ALG_DEFAULT) !=
           CUSPARSE_STATUS_SUCCESS) {
+        ++consecutive_failures;
+        if (consecutive_failures >= kMaxConsecutiveFailures) break;
         continue;
       }
       cusparseStatus_t set_st = cusparseLtMatmulAlgSetAttribute(
@@ -359,7 +347,9 @@ py::dict search_topk(torch::Tensor W_pruned_bf16, torch::Tensor A_bf16,
           sizeof(probe));
       if (set_st != CUSPARSE_STATUS_SUCCESS) {
         cusparseLtMatmulAlgSelectionDestroy(&sel);
-        continue;  // 这个ID设置失败，继续尝试下一个
+        ++consecutive_failures;
+        if (consecutive_failures >= kMaxConsecutiveFailures) break;
+        continue;
       }
       // 关键：以 planInit 成功为准
       cusparseLtMatmulPlan_t plan_probe;
@@ -368,7 +358,11 @@ py::dict search_topk(torch::Tensor W_pruned_bf16, torch::Tensor A_bf16,
       cusparseLtMatmulAlgSelectionDestroy(&sel);
       if (plan_st == CUSPARSE_STATUS_SUCCESS) {
         max_alg_id = probe;  // 更新最大有效ID
+        consecutive_failures = 0;  // 重置连续失败计数
         cusparseLtMatmulPlanDestroy(&plan_probe);
+      } else {
+        ++consecutive_failures;
+        if (consecutive_failures >= kMaxConsecutiveFailures) break;
       }
     }
   }
