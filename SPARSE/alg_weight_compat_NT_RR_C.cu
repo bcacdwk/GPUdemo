@@ -694,7 +694,7 @@ int main() {
     std::cout << "检测到GPU: " << gpuName << std::endl;
     std::cout << "========================================" << std::endl;
     
-    std::string baseDir = "alg_weight_compat_matrix";
+    std::string baseDir = "alg_weight_compat_matrix_NT_RR_C";
     std::string outputDir = baseDir + "/" + gpuName;
     
     createDirectory(outputDir);
